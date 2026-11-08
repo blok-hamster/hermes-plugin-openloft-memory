@@ -34,7 +34,7 @@ FIELDS = [
         "secret": True,
         "required": True,
         "env_var": "OPENLOFT_MEMORY_API_KEY",
-        "url": "https://app.openloft.xyz/dashboard/memory/connections",
+        "url": "https://www.openloft.xyz/memory/connections",
     },
     {
         "key": "agent_id",

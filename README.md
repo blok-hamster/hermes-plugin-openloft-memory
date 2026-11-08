@@ -39,7 +39,7 @@ hermes openloft-memory health
 Get a key first:
 
 - **Hosted**: OpenLoft dashboard → Memory → Connections → mint. The secret is
-  shown exactly once. (`https://app.openloft.xyz/dashboard/memory/connections`)
+  shown exactly once. (`https://www.openloft.xyz/memory/connections`)
   Check the service is live for your account before first use.
 - **Self-hosted**: run the OpenLoft memory service, then mint from the same
   dashboard when it is wired through the platform backend, or generate a

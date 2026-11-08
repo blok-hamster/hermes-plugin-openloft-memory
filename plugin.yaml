@@ -10,7 +10,7 @@ tags:
 requires_env:
   - name: OPENLOFT_MEMORY_API_KEY
     description: "OpenLoft memory key. Mint one from the dashboard (Memory > Connections), or self-host the memory service."
-    url: "https://app.openloft.xyz/dashboard/memory/connections"
+    url: "https://www.openloft.xyz/memory/connections"
     secret: true
 hooks:
   - prefetch
