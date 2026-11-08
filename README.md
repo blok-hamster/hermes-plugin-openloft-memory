@@ -80,6 +80,31 @@ variables, so profile isolation holds under multiplexed gateways.
 | `pre_compress_archive` | `false` | **Phase 3**: archive transcript evidence before context compression via `on_pre_compress`, idempotent by content digest; forced when Hermes sets `require_checkpoint` (`compression.checkpoint_required: true`) |
 | `memory_write_mirror` | `false` | **Phase 3**: mirror explicit MEMORY.md / USER.md writes into OpenLoft via `on_memory_write`; destructive writes are skipped when no `previous_content` is seen |
 
+### Agent ID & Conversation ID
+
+These two values determine where memories are stored in the OpenLoft substrate.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `agent_id` | `auto` | Resolves to: config → `OPENLOFT_MEMORY_AGENT_ID` env → Hermes profile name → `hermes`. One agent id = one isolated memory pool. Change it to isolate memories between different agents/users. |
+| `conversation_scope` | `agent` | `agent` (recommended) uses one pool per agent, immune to session rotation. `session` uses one pool per Hermes session — memories fragment if the session id rotates. `shared` uses the tenant's pre-agent store, visible to all agents. |
+
+**Change `agent_id`:**
+```bash
+# Option A: Environment variable (takes effect immediately)
+export OPENLOFT_MEMORY_AGENT_ID="my-agent"
+
+# Option B: Via Hermes setup (persisted)
+hermes memory setup   # select openloft-memory, set agent_id
+```
+
+**Change `conversation_scope`:**
+```bash
+hermes memory setup   # select openloft-memory, set conversation_scope to session or shared
+```
+
+**Defaults:** `agent_id` resolves to `hermes` and `conversation_scope` is `agent` — all memories go into the default pool for the `hermes` agent. This works out of the box for single-agent setups.
+
 ## Self-hosting
 
 Point `base_url` at your memory service (`http://<host>:8100/v1/memory`) and

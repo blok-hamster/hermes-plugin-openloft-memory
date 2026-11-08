@@ -14,7 +14,7 @@ provider for any Hermes Agent deployment (hosted default edge or self-hosted
 | Recall | Injected before every LLM turn via `prefetch`; fail-open, budgeted (6,000-char injection cap, 8s socket timeout) |
 | Ingest | Every completed turn persisted in the background via `sync_turn` (`spawn_context_thread`, join-first, single-in-flight) |
 | Tools | `loft_recall`, `loft_remember`, `loft_forget`, `loft_stats`, `loft_search` (JSON-always handlers) |
-| Identity | Config → `OPENLOFT_MEMORY_AGENT_ID` → Hermes profile name → `hermes`; one pool per agent by default |
+| Identity | Config → `OPENLOFT_MEMORY_AGENT_ID` → Hermes profile name → `hermes`; one pool per agent by default. Configurable via `agent_id` config key or `OPENLOFT_MEMORY_AGENT_ID` env var. Conversation scope defaults to `agent` (one pool per agent, immune to session rotation); `session` and `shared` are opt-in. |
 | Backend | Hosted `https://api.openloft.xyz/api/memory` or self-hosted `http://<host>:8100/v1/memory`; snake_case bodies always |
 
 ## Hermes surfaces used (documented contract only)
@@ -58,6 +58,6 @@ provider for any Hermes Agent deployment (hosted default edge or self-hosted
 - Zero Python dependencies (stdlib-only client)
 - No self-updater code (catalog rule 3)
 - No core overrides, no monkey-patching (rule 9)
-- `requires_hermes: ">=0.21.0"` — placeholder floor; must be measured against
-  a real Hermes install and declared identically in `plugin.yaml` and this
-  entry before merge (rule 14)
+- `requires_hermes: ">=0.19.0"` — measured on Hermes v0.19.0; plugin loads,
+  registers, and passes full E2E on that version. Declared identically in
+  `plugin.yaml` and this entry (rule 14).
