@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install test tooling
+        run: python -m pip install pytest pyyaml
+      - name: Suite (stdlib-only; hermes-dependent tests skip)
+        run: python -m pytest tests/ -q
+
+  catalog-hygiene:
+    # Catalog rules 3 (no self-updater) and 14 (truthful compat metadata):
+    # cheap greps stay green so features can never drift into this quietly.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No self-updating code (catalog rule 3)
+        run: |
+          if grep -RInE "(check[_-]?for[_-]?update|self[_-]?update|releases/latest|fetch[_-]?latest)" \
+              --include="*.py" --include="*.yaml" --exclude-dir=.github . ; then
+              echo "::error::possible self-updater code found — the catalog forbids it"
+              exit 1
+          fi
+      - name: Manifest is a loadable mapping with the loader's fields
+        run: |
+          python - <<'EOF'
+          import yaml
+          manifest = yaml.safe_load(open("plugin.yaml"))
+          for field in ("name", "version", "description", "requires_env", "hooks"):
+              assert field in manifest, field
+          assert manifest["name"] == "openloft-memory"
+          assert str(manifest["version"]).count(".") >= 1
+          print("plugin.yaml ok:", manifest["name"], manifest["version"])
+          EOF

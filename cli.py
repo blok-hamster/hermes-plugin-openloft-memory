@@ -25,6 +25,13 @@ def _hermes_home() -> Path:
     return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 
 
+def _config_path() -> Path:
+    """Same file the Desktop panel edits (STORAGE_FLAT_JSON convention)."""
+    from .config_schema import runtime_config_path
+
+    return runtime_config_path(str(_hermes_home()))
+
+
 def _backend():
     """Build a configured client or exit with an actionable message."""
     from agent.secret_scope import get_secret
@@ -38,7 +45,7 @@ def _backend():
     from .config_schema import DEFAULT_BASE_URL
 
     base = os.environ.get("OPENLOFT_MEMORY_BASE_URL")
-    cfg_file = _hermes_home() / "openloft-memory.json"
+    cfg_file = _config_path()
     if base is None and cfg_file.exists():
         try:
             base = json.loads(cfg_file.read_text()).get("base_url")

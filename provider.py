@@ -32,7 +32,12 @@ from .client import (
     ScopeError,
     ServiceClient,
 )
-from .config_schema import DEFAULT_BASE_URL, FIELDS, runtime_config
+from .config_schema import (
+    DEFAULT_BASE_URL,
+    FIELDS,
+    runtime_config,
+    runtime_config_path,
+)
 from .schemas import (
     SYSTEM_PROMPT_BLOCK,
     friendly_error,
@@ -45,7 +50,6 @@ from .scope import resolve_agent_id, resolve_conversation_id
 logger = logging.getLogger("hermes.plugins.openloft-memory")
 
 PLUGIN_NAME = "openloft-memory"
-CONFIG_FILE = "openloft-memory.json"
 
 _SYNC_JOIN_TIMEOUT = 5.0   # how long a turn's ingest waits for its predecessor
 # The recall wall budget is enforced by the client's per-socket timeout
@@ -147,8 +151,10 @@ class OpenLoftMemoryProvider(MemoryProvider):
         """Fire-and-forget warm-up; result discarded."""
         if not self._ready() or not self._cfg.get("warm_next_turn", True):
             return
+        def job() -> None:
+            self._warm(query, session_id)
         try:
-            spawn_context_thread(self._warm, (query, session_id), name="openloft-memory-warm")
+            self._spawn(job, "openloft-memory-warm")
         except Exception as exc:  # noqa: BLE001
             logger.debug("openloft-memory: warm skipped (%s)", exc)
 
@@ -162,9 +168,9 @@ class OpenLoftMemoryProvider(MemoryProvider):
         if not payload:
             return
         previous = self._sync_thread
-        self._sync_thread = spawn_context_thread(
-            self._ingest, (payload, session_id, previous), name="openloft-memory-sync"
-        )
+        def job() -> None:
+            self._ingest(payload, session_id, previous)
+        self._sync_thread = self._spawn(job, "openloft-memory-sync")
 
     def system_prompt_block(self) -> str | None:
         return SYSTEM_PROMPT_BLOCK
@@ -183,10 +189,14 @@ class OpenLoftMemoryProvider(MemoryProvider):
     # -- config write path -------------------------------------------------------
 
     def save_config(self, values: dict, hermes_home: str) -> None:
-        """Persist non-secret settings to our flat JSON (plan §4.1)."""
-        data_dir = Path(hermes_home)
-        data_dir.mkdir(parents=True, exist_ok=True)
-        target = data_dir / CONFIG_FILE
+        """Persist non-secret settings (plan §4.1).
+
+        Path convention from the Desktop panel (STORAGE_FLAT_JSON):
+        ``$HERMES_HOME/<name>/config.json`` — the same file the panel edits,
+        so a dashboard change and our runtime binding never diverge.
+        """
+        target = runtime_config_path(hermes_home)
+        target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(values, indent=2, sort_keys=True) + "\n")
         os.replace(tmp, target)
@@ -247,6 +257,25 @@ class OpenLoftMemoryProvider(MemoryProvider):
 
     # -- internals -------------------------------------------------------------------
 
+    def _spawn(self, job, name: str):
+        """spawn_context_thread with both documented start semantics tolerated.
+
+        The threading contract gives ``spawn_context_thread(fn, name=...)`` a
+        contextvars-wired thread; whether that helper starts the thread itself
+        or hands it back for an explicit .start() is not observable without a
+        Hermes install, so we handle both and neither ever runs un-started.
+        """
+        try:
+            thread = spawn_context_thread(job, name=name)
+        except TypeError:
+            thread = spawn_context_thread(job)
+        try:
+            if not thread.is_alive():
+                thread.start()
+        except (RuntimeError, AttributeError):
+            pass  # already started, or the helper returned None-style behavior
+        return thread
+
     def _ready(self) -> bool:
         return bool(self._client and self._client.api_key)
 
@@ -255,13 +284,13 @@ class OpenLoftMemoryProvider(MemoryProvider):
 
     def _load_runtime_config(self) -> dict:
         try:
-            raw = (Path(self._hermes_home) / CONFIG_FILE).read_text() if self._hermes_home else ""
+            raw = runtime_config_path(self._hermes_home).read_text() if self._hermes_home else ""
         except OSError:
             raw = ""
         try:
             saved = json.loads(raw) if raw.strip() else {}
         except json.JSONDecodeError:
-            logger.warning("openloft-memory: %s did not parse; using defaults", CONFIG_FILE)
+            logger.warning("openloft-memory: config.json did not parse; using defaults")
             saved = {}
         return runtime_config(saved, self._hermes_home)
 

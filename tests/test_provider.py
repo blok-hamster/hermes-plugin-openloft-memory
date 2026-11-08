@@ -176,7 +176,9 @@ class TestConfigBinding:
     def test_scope_mode_read_from_runtime_config(self, monkeypatch, tmp_path):
         home = tmp_path / ".hermes"
         home.mkdir()
-        (home / "openloft-memory.json").write_text(json.dumps({"base_url": "http://x:1/v1/memory"}))
+        (home / "openloft-memory").mkdir()
+        (home / "openloft-memory" / "config.json").write_text(
+            json.dumps({"base_url": "http://x:1/v1/memory"}))
         with_key(monkeypatch, "nmafc_t.k")
         prov = OpenLoftMemoryProvider()
         prov.initialize("s", hermes_home=str(home))
@@ -191,6 +193,59 @@ class TestConfigBinding:
         two = OpenLoftMemoryProvider()
         two.initialize("s", hermes_home=str(prof_b), agent_identity="beta")
         assert one._agent_id == "alpha" and two._agent_id == "beta"
+
+
+class TestSpawnSemantics:
+    """The threading contract's spawn may start the thread itself or hand it
+    back for an explicit .start(); the provider must work under both."""
+
+    def _bound_provider(self):
+        prov, httpd = provider()
+        httpd.shutdown()
+        prov._client = ServiceClient(base_url="http://127.0.0.1:1/v1/memory",
+                                     api_key="nmafc_probe.secret")
+        return prov
+
+    def test_unstarted_thread_gets_started_and_completes(self):
+        import threading
+        import openloft_memory.provider as prov_mod
+
+        prov = self._bound_provider()
+        started_by_us = threading.Event()
+        real_spawn = prov_mod.spawn_context_thread
+
+        def fake_spawn(fn, name="x"):
+            return threading.Thread(target=lambda: (fn(), started_by_us.set()),
+                                    daemon=True, name=name)
+
+        prov_mod.spawn_context_thread = fake_spawn
+        try:
+            prov.sync_turn("u", "a")
+            thread = prov._sync_thread
+            thread.join(timeout=5.0)
+        finally:
+            prov_mod.spawn_context_thread = real_spawn
+        assert started_by_us.is_set()      # _spawn called .start() (job ran)…
+
+    def test_prestarted_thread_is_never_double_started(self):
+        import threading
+        import openloft_memory.provider as prov_mod
+
+        prov = self._bound_provider()
+        real_spawn = prov_mod.spawn_context_thread
+
+        def fake_spawn(fn, name="x"):
+            thread = threading.Thread(target=fn, daemon=True, name=name)
+            thread.start()
+            return thread
+
+        prov_mod.spawn_context_thread = fake_spawn
+        try:
+            prov.sync_turn("u", "a")      # must not raise — no double .start()
+            prov._sync_thread.join(timeout=5.0)
+        finally:
+            prov_mod.spawn_context_thread = real_spawn
+        assert not prov._sync_thread.is_alive()
 
 
 @real_hermes

@@ -7,7 +7,18 @@ documented in README.md (plan §2, "keep the schema minimal").
 
 from __future__ import annotations
 
+from pathlib import Path
+
 DEFAULT_BASE_URL = "https://api.openloft.xyz/api/memory"
+
+# Panel + runtime use ONE file (Desktop STORAGE_FLAT_JSON convention:
+# $HERMES_HOME/<name>/config.json), so dashboard edits and the provider's
+# runtime binding can never diverge.
+CONFIG_DIR_NAME = "openloft-memory"
+
+
+def runtime_config_path(hermes_home: str | None) -> Path:
+    return Path(hermes_home or "") / CONFIG_DIR_NAME / "config.json"
 
 FIELDS = [
     {
@@ -23,6 +34,7 @@ FIELDS = [
         "secret": True,
         "required": True,
         "env_var": "OPENLOFT_MEMORY_API_KEY",
+        "url": "https://app.openloft.xyz/dashboard/memory/connections",
     },
     {
         "key": "agent_id",
@@ -85,7 +97,8 @@ def runtime_config(profile_json: dict | None, hermes_home: str | None = None) ->
     """Merge schema defaults under a user-editable runtime config file.
 
     The file is the provider's own flat JSON,
-    ``$HERMES_HOME/openloft-memory.json`` (written atomically by
+    ``$HERMES_HOME/openloft-memory/config.json`` (the Desktop panel's flat JSON,
+    written atomically by ``save_config`` / edited by users). Secrets never come
     ``save_config`` / edited by users). Secrets never come back from here —
     the key is resolved separately through
     ``agent.secret_scope.get_secret("OPENLOFT_MEMORY_API_KEY")``.
