@@ -29,7 +29,7 @@ Only one external memory provider may be active per agent (`memory.provider`).
 
 ```bash
 # drop-in install (catalog listing is a separate human-reviewed track)
-git clone https://github.com/OWNER/hermes-plugin-openloft-memory \
+git clone https://github.com/blok-hamster/hermes-plugin-openloft-memory \
       "$HOME/.hermes/plugins/openloft-memory"
 
 hermes plugins enable openloft-memory   # prompts for OPENLOFT_MEMORY_API_KEY

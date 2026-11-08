@@ -1,5 +1,6 @@
 name: openloft-memory
 version: "0.1.0"
+homepage: "https://github.com/blok-hamster/hermes-plugin-openloft-memory"
 description: "OpenLoft Memory — persistent, graph-backed long-term memory for any Hermes agent. Recall before every turn, ingest after every turn, loft_* memory tools."
 author: OpenLoft
 license: MIT
