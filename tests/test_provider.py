@@ -10,6 +10,7 @@ outside a genuine Hermes installation; they run in gate phase 1.9.
 
 import json
 import logging
+import threading
 
 import pytest
 
@@ -103,9 +104,9 @@ class TestPrefetch:
         prov, httpd = provider()
         try:
             res = prov.prefetch("what do I know")
-            assert res is None or isinstance(res, dict)   # empty context → None
-            if res is not None:
-                assert "context" in res
+            assert res == "" or isinstance(res, str)   # empty context → ""
+            if res:
+                assert "context" not in res   # prefetch returns raw text now
         finally:
             httpd.shutdown()
 
@@ -197,8 +198,7 @@ class TestConfigBinding:
 
 
 class TestSpawnSemantics:
-    """The threading contract's spawn may start the thread itself or hand it
-    back for an explicit .start(); the provider must work under both."""
+    """Thread spawning (Phase 3): _spawn starts threads with contextvar propagation."""
 
     def _bound_provider(self):
         prov, httpd = provider()
@@ -207,46 +207,32 @@ class TestSpawnSemantics:
                                      api_key="nmafc_probe.secret")
         return prov
 
-    def test_unstarted_thread_gets_started_and_completes(self):
-        import threading
-        import openloft_memory.provider as prov_mod
-
+    def test_spawn_starts_thread_and_job_runs(self):
         prov = self._bound_provider()
-        started_by_us = threading.Event()
-        real_spawn = prov_mod.spawn_context_thread
+        job_ran: threading.Event = threading.Event()
 
-        def fake_spawn(fn, name="x"):
-            return threading.Thread(target=lambda: (fn(), started_by_us.set()),
-                                    daemon=True, name=name)
+        def job():
+            job_ran.set()
 
-        prov_mod.spawn_context_thread = fake_spawn
-        try:
-            prov.sync_turn("u", "a")
-            thread = prov._sync_thread
-            thread.join(timeout=5.0)
-        finally:
-            prov_mod.spawn_context_thread = real_spawn
-        assert started_by_us.is_set()      # _spawn called .start() (job ran)…
+        thread = prov._spawn(job, "test-spawn")
+        thread.join(timeout=5.0)
+        assert job_ran.is_set()      # _spawn started the thread and the job ran
+        assert not thread.is_alive()
 
-    def test_prestarted_thread_is_never_double_started(self):
-        import threading
-        import openloft_memory.provider as prov_mod
-
+    def test_spawn_propagates_contextvars(self):
+        import contextvars
         prov = self._bound_provider()
-        real_spawn = prov_mod.spawn_context_thread
 
-        def fake_spawn(fn, name="x"):
-            thread = threading.Thread(target=fn, daemon=True, name=name)
-            thread.start()
-            return thread
+        my_var = contextvars.ContextVar("test_var", default="unset")
+        my_var.set("set-before-spawn")
+        seen = {}
 
-        prov_mod.spawn_context_thread = fake_spawn
-        try:
-            prov.sync_turn("u", "a")      # must not raise — no double .start()
-            prov._sync_thread.join(timeout=5.0)
-        finally:
-            prov_mod.spawn_context_thread = real_spawn
-        assert not prov._sync_thread.is_alive()
+        def job():
+            seen["val"] = my_var.get()
+
+        thread = prov._spawn(job, "test-context")
+        thread.join(timeout=5.0)
+        assert seen["val"] == "set-before-spawn"   # context propagated into thread
 
 
 class TestPhase3Hardening:
@@ -259,8 +245,7 @@ class TestPhase3Hardening:
         prov, httpd = provider()
         try:
             SubstrateStub.seen = {}
-            assert prov.on_pre_compress(self._MSGS) == {
-                "checkpointed": False, "skipped": "opt_out"}
+            assert prov.on_pre_compress(self._MSGS) == ""
             assert SubstrateStub.seen == {}   # nothing sent to the substrate
         finally:
             httpd.shutdown()
@@ -271,8 +256,8 @@ class TestPhase3Hardening:
         try:
             SubstrateStub.seen = {}
             res = prov.on_pre_compress(self._MSGS)
-            assert res["checkpointed"] is True
-            digest = res["digest"]
+            assert res.startswith("[openloft-memory: checkpoint ")
+            digest = res.split(" ")[-1].rstrip("]")
             assert len(digest) == 64     # SHA-256 hex
             body = SubstrateStub.seen["body"]
             assert body["messages"] == self._MSGS
@@ -287,7 +272,7 @@ class TestPhase3Hardening:
         try:
             SubstrateStub.seen = {}
             res = prov.on_pre_compress(self._MSGS, require_checkpoint=True)
-            assert res["checkpointed"] is True
+            assert res.startswith("[openloft-memory: checkpoint ")
             assert SubstrateStub.seen["body"]["messages"] == self._MSGS
         finally:
             httpd.shutdown()
@@ -297,12 +282,12 @@ class TestPhase3Hardening:
         try:
             SubstrateStub.seen = {}
             first = prov.on_pre_compress(self._MSGS)
-            assert first["checkpointed"] is True
+            assert first.startswith("[openloft-memory: checkpoint ")
             second = prov.on_pre_compress(self._MSGS)
-            assert second["checkpointed"] is False
-            assert second["skipped"] == "duplicate"
-            assert second["digest"] == first["digest"][:12]
-            assert SubstrateStub.seen["body"]["messages"] == self._MSGS  # no second request overwrote it
+            assert second.startswith("[openloft-memory: duplicate checkpoint ")
+            assert second.split(" ")[-1].rstrip("]") == first.split(" ")[-1].rstrip("]")[:12]
+            # Only one remember call went out
+            assert SubstrateStub.seen["body"]["messages"] == self._MSGS
         finally:
             httpd.shutdown()
 
@@ -310,8 +295,7 @@ class TestPhase3Hardening:
         prov, httpd = provider()
         httpd.shutdown()
         prov._client = None
-        assert prov.on_pre_compress(self._MSGS) == {
-            "checkpointed": False, "skipped": "not_ready"}
+        assert prov.on_pre_compress(self._MSGS) == ""
 
     def test_write_mirror_skipped_when_opted_out(self):
         prov, httpd = provider()

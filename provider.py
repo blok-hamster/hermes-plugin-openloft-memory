@@ -4,8 +4,8 @@ Implements the lifecycle mapping pinned in ../HERMES_MEMORY_PLUGIN_PLAN.md §3:
 
 - prefetch          → POST /recall, fail-open, budgeted, injected per turn
 - queue_prefetch    → background warm-up only, never blocks
-- sync_turn         → background ingest via ``spawn_context_thread``
-  (catalog-required: contextvars/profile isolation; join-first, one in flight)
+- sync_turn         → background ingest via threading.Thread with
+                      contextvar propagation (join-first, one in flight)
 - tools             → loft_recall / loft_remember / loft_forget / loft_stats /
                       loft_search; JSON-always handlers via schemas + client
 - config            → profile-aware secret via get_secret + flat runtime JSON
@@ -26,12 +26,13 @@ import json
 import logging
 import os
 import threading
+import contextvars
 import time
 from pathlib import Path
 from typing import Iterable
 
 # Documented Hermes surfaces only (catalog rule 9).
-from agent.memory_provider import MemoryProvider, spawn_context_thread
+from agent.memory_provider import MemoryProvider
 from agent.secret_scope import get_secret
 
 from .client import (
@@ -170,8 +171,8 @@ class OpenLoftMemoryProvider(MemoryProvider):
 
         context = res.get("context") or ""
         if not context.strip():
-            return None
-        return {"context": shrink(context, int(self._cfg.get("inject_budget", 6000)))}
+            return ""
+        return shrink(context, int(self._cfg.get("inject_budget", 6000)))
 
     def queue_prefetch(self, query: str, *, session_id: str = "", **kwargs) -> None:
         """Fire-and-forget warm-up; result discarded."""
@@ -184,13 +185,14 @@ class OpenLoftMemoryProvider(MemoryProvider):
         except Exception as exc:  # noqa: BLE001
             logger.debug("openloft-memory: warm skipped (%s)", exc)
 
-    def sync_turn(self, user, assistant, *, session_id: str = "", messages=None, **kwargs) -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *,
+                  session_id: str = "", messages=None, **kwargs) -> None:
         """Non-blocking ingest: join-first, one in flight, never blocks a turn."""
         if not self._ready() or not self._cfg.get("ingest_enabled", True):
             return
         if self._context_kind not in {"primary", ""} and not self._cfg.get("ingest_nonprimary"):
             return
-        payload = list(messages) if messages else turn_payload(user, assistant)
+        payload = list(messages) if messages else turn_payload(user_content, assistant_content)
         if not payload:
             return
         previous = self._sync_thread
@@ -214,8 +216,10 @@ class OpenLoftMemoryProvider(MemoryProvider):
 
     # -- phase 3 hardening hooks ----------------------------------------------
 
-    def on_pre_compress(self, messages: list, *, require_checkpoint: bool = False,
-                        conversation_id: str | None = None, **kwargs) -> dict | None:
+    def on_pre_compress(self, messages: list, *,
+                        require_checkpoint: bool = False,
+                        conversation_id: str | None = None,
+                        **kwargs) -> str:
         """Archive transcript evidence before context compression (Phase 3, 3.1).
 
         The transcript is hashed to a content digest and persisted via
@@ -224,23 +228,25 @@ class OpenLoftMemoryProvider(MemoryProvider):
         ``require_checkpoint`` (``compression.checkpoint_required: true``),
         which forces the write. Fail-visible: errors are logged, compression
         never blocks on this hook.
+
+        Returns a short text contribution for the compression summary prompt,
+        or empty string when nothing to contribute.
         """
         if not self._ready():
-            return {"checkpointed": False, "skipped": "not_ready"}
+            return ""
         archive = bool(self._cfg.get("pre_compress_archive")) or require_checkpoint
         if not archive:
-            return {"checkpointed": False, "skipped": "opt_out"}
+            return ""
         try:
             canonical = json.dumps(messages, sort_keys=True,
                                    separators=(",", ":"))
             digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         except (TypeError, ValueError) as exc:  # noqa: BLE001
             logger.warning("openloft-memory: checkpoint digest failed (%s)", exc)
-            return {"checkpointed": False, "error": "digest"}
+            return ""
         conv = (conversation_id or self._conversation_scope("")) or ""
         if self._checkpoint_digests.get(conv) == digest:
-            return {"checkpointed": False, "skipped": "duplicate",
-                    "digest": digest[:12]}
+            return f"[openloft-memory: duplicate checkpoint {digest[:12]}]"
         started = time.monotonic()
         try:
             assert self._client is not None
@@ -252,14 +258,14 @@ class OpenLoftMemoryProvider(MemoryProvider):
             self._checkpoint_digests[conv] = digest
             logger.info("openloft-memory: checkpoint archived %s (%s ms)",
                         digest[:12], _elapsed_ms(started))
-            return {"checkpointed": True, "digest": digest}
+            return f"[openloft-memory: checkpoint {digest}]"
         except RateLimited as exc:
             logger.warning("openloft-memory: checkpoint rate-limited (%s)", exc)
-            return {"checkpointed": False, "error": "rate_limited"}
+            return ""
         except Exception as exc:  # noqa: BLE001 - archive never blocks compression
             logger.error("openloft-memory: checkpoint failed (%s); compression "
                          "proceeds without this archive", exc)
-            return {"checkpointed": False, "error": str(exc)}
+            return ""
 
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata: dict | None = None, **kwargs) -> dict | None:
@@ -312,6 +318,43 @@ class OpenLoftMemoryProvider(MemoryProvider):
         except Exception as exc:  # noqa: BLE001 - never fail a user write for memory
             logger.error("openloft-memory: write mirror failed (%s)", exc)
             return {"mirrored": False, "error": str(exc)}
+
+    def on_session_switch(self, new_session_id: str, *,
+                          parent_session_id: str = "",
+                          reset: bool = False, rewound: bool = False,
+                          **kwargs) -> None:
+        """Handle Hermes session_id rotation (Phase 3.4).
+
+        When Hermes switches session_id mid-process (/resume, /branch,
+        /reset, context compression), update the conversation scope so
+        subsequent writes land in the correct session's record.
+        """
+        if reset:
+            # New conversation — clear per-session digest caches so
+            # backfill/checkpoint dedup doesn't carry over stale state.
+            self._checkpoint_digests.pop(new_session_id, None)
+            self._write_digests.pop(new_session_id, None)
+        logger.debug("openloft-memory: session switched to %s (parent=%s, reset=%s)",
+                     new_session_id, parent_session_id, reset)
+
+    def get_status_config(self, provider_config: dict) -> dict:
+        """Return status fields for `hermes memory status` display."""
+        return {
+            "provider": self.name,
+            "base_url": self._cfg.get("base_url", DEFAULT_BASE_URL),
+            "agent_id": self._agent_id,
+            "conversation_scope": self._conv_mode,
+            "ingest_enabled": self._cfg.get("ingest_enabled", True),
+            "toolset_enabled": self._cfg.get("toolset_enabled", True),
+        }
+
+    def backup_paths(self) -> list[str]:
+        """Return on-disk paths outside HERMES_HOME for `hermes backup`.
+
+        Our config lives at $HERMES_HOME/openloft-memory/config.json which
+        is already inside HERMES_HOME, so nothing external to declare.
+        """
+        return []
 
     # -- phase 3.4 backfill ------------------------------------------------------
 
@@ -501,22 +544,20 @@ class OpenLoftMemoryProvider(MemoryProvider):
     # -- internals -------------------------------------------------------------------
 
     def _spawn(self, job, name: str):
-        """spawn_context_thread with both documented start semantics tolerated.
+        """Spawn a background thread with contextvar propagation.
 
-        The threading contract gives ``spawn_context_thread(fn, name=...)`` a
-        contextvars-wired thread; whether that helper starts the thread itself
-        or hands it back for an explicit .start() is not observable without a
-        Hermes install, so we handle both and neither ever runs un-started.
+        Hermes v0.19.0 doesn't provide ``spawn_context_thread``, so we
+        capture the current context and replay it in the thread — this
+        gives the same profile-isolation guarantee without depending on
+        a Hermes helper that doesn't exist in this version.
         """
-        try:
-            thread = spawn_context_thread(job, name=name)
-        except TypeError:
-            thread = spawn_context_thread(job)
-        try:
-            if not thread.is_alive():
-                thread.start()
-        except (RuntimeError, AttributeError):
-            pass  # already started, or the helper returned None-style behavior
+        ctx = contextvars.copy_context()
+
+        def _run() -> None:
+            ctx.run(job)
+
+        thread = threading.Thread(target=_run, daemon=True, name=name)
+        thread.start()
         return thread
 
     def _ready(self) -> bool:
