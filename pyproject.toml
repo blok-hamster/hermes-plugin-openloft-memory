@@ -1,0 +1,8 @@
+[project]
+name = "hermes-plugin-openloft-memory"
+version = "0.1.0"
+description = "OpenLoft Memory — a memory provider plugin for Hermes Agent"
+requires-python = ">=3.11"
+license = "MIT"
+# dependencies = []  — deliberately omitted. The client is stdlib-only so the
+# plugin installs with no dependency union / consent step in any environment.
