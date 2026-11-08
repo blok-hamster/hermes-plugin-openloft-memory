@@ -82,6 +82,29 @@ def _run(args) -> None:
             entity_name=None if args.record_id else args.target,
             record_id=args.record_id,
         ), indent=2))
+    elif args.subcommand == "backfill":
+        from .provider import OpenLoftMemoryProvider
+
+        if not args.sessions_file:
+            print("backfill needs a sessions file: --sessions-file <path>")
+            print("The session list comes from Hermes' session-history surface")
+            print("(stub adapter — see cli.py backfill TODO).")
+            sys.exit(2)
+        try:
+            sessions = json.loads(Path(args.sessions_file).read_text())
+        except Exception as exc:  # noqa: BLE001
+            print(f"could not read sessions file: {exc}")
+            sys.exit(2)
+
+        prov = OpenLoftMemoryProvider()
+        prov.initialize("cli", hermes_home=str(_hermes_home()), platform="cli",
+                        agent_identity=os.environ.get("HERMES_PROFILE", ""))
+        result = prov.backfill(
+            sessions,
+            limit=args.limit,
+            dry_run=args.dry_run,
+        )
+        print(json.dumps(result, indent=2))
 
 
 def register_cli(subparser) -> None:
@@ -106,6 +129,16 @@ def register_cli(subparser) -> None:
                         help="Forget one record instead of a whole entity")
     forget.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
     forget.set_defaults(func=_run, subcommand="forget")
+
+    backfill = subs.add_parser("backfill",
+                               help="Ingest historical session transcripts into memory")
+    backfill.add_argument("--sessions-file", default=None,
+                          help="JSON file with session list (Hermes-dependent source)")
+    backfill.add_argument("--limit", type=int, default=None,
+                          help="Max sessions to ingest in this run")
+    backfill.add_argument("--dry-run", action="store_true",
+                          help="Show what would be ingested without writing")
+    backfill.set_defaults(func=_run, subcommand="backfill")
 
     # Bare `hermes openloft-memory` falls back to stats.
     subparser.set_defaults(func=_run, subcommand="stats")

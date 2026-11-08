@@ -90,6 +90,23 @@ FIELDS = [
                        "edits) into OpenLoft as searchable records (Phase 3)",
         "default": False,
     },
+    {
+        "key": "backfill_enabled",
+        "description": "Ingest an agent's existing Hermes session transcripts "
+                       "into OpenLoft on demand (Phase 3.4)",
+        "default": False,
+    },
+    {
+        "key": "backfill_batch_size",
+        "description": "Sessions ingested per backfill run (Phase 3.4)",
+        "default": 10,
+    },
+    {
+        "key": "backfill_rate_ms",
+        "description": "Minimum delay (ms) between remember calls during backfill "
+                       "(Phase 3.4; keeps us under the 300/min global rate limit)",
+        "default": 1500,
+    },
 ]
 
 RUNTIME_DEFAULTS = {
