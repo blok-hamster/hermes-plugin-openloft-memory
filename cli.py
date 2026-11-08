@@ -72,6 +72,19 @@ def _run(args) -> None:
     elif args.subcommand == "search":
         print(json.dumps(
             client.search(args.query, agent_id=_agent_id(), limit=args.limit), indent=2))
+    elif args.subcommand == "remember":
+        print("Remembering via OpenLoft memory…")
+        print(json.dumps(client.remember(
+            [{"role": "user", "content": args.text}],
+            agent_id=_agent_id(),
+        ), indent=2))
+    elif args.subcommand == "recall":
+        print("Recalling from OpenLoft memory…")
+        print(json.dumps(client.recall(
+            args.query,
+            agent_id=_agent_id(),
+            top_k=args.top_k,
+        ), indent=2))
     elif args.subcommand == "forget":
         print("Forget = TEMPORAL INVALIDATION. The fact stops being retrieved;")
         print("the write-ahead log retains it. This is not erasure.")
@@ -122,6 +135,18 @@ def register_cli(subparser) -> None:
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=10)
     search.set_defaults(func=_run, subcommand="search")
+
+    remember = subs.add_parser("remember",
+                               help="Store a fact in OpenLoft memory")
+    remember.add_argument("text", help="Text to remember")
+    remember.set_defaults(func=_run, subcommand="remember")
+
+    recall = subs.add_parser("recall",
+                             help="Recall relevant facts from OpenLoft memory")
+    recall.add_argument("query", help="What to recall")
+    recall.add_argument("--top-k", type=int, default=8,
+                        help="Max number of facts to return")
+    recall.set_defaults(func=_run, subcommand="recall")
 
     forget = subs.add_parser("forget", help="Stop retrieving a stored fact (not erasure)")
     forget.add_argument("target", help="Entity name to forget")
