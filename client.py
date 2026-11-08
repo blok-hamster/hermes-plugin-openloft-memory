@@ -25,6 +25,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from .scope import SCOPE_RE
+
 CONNECT_RETRIES_READS = 1
 CONNECT_RETRY_WAIT = 0.4
 
@@ -153,6 +155,12 @@ class ServiceClient:
                                "entity_name": entity_name, "record_id": record_id})
         if ("entity_name" in payload) == ("record_id" in payload):
             raise ScopeError("forget needs exactly one of entity_name / record_id")
+        # The substrate allowlists these values on its GET record paths but not
+        # on forget itself; the engine splices record ids into a shared-table
+        # predicate, so anything outside the scope charset is refused HERE.
+        for key in ("entity_name", "record_id"):
+            if key in payload and not SCOPE_RE.match(str(payload[key])):
+                raise ScopeError(f"{key} may contain only letters, digits, '-' and '_'")
         return self.request("POST", "/forget", body=payload, timeout=DEFAULT_TIMEOUTS["forget"])
 
     def stats(self, *, agent_id: str, conversation_id: str | None = None):

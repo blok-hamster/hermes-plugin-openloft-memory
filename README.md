@@ -79,6 +79,16 @@ python3 -m pytest tests/ -q        # stdlib-only suite; hermes-dependent tests s
 hermes plugins doctor . --ci       # inside a Hermes environment
 ```
 
+Contract suite against the REAL memory service (boots it right here with
+deterministic provider fakes at the engine boundary — no model downloads, no
+keys in your tree):
+
+```bash
+# runs the service.vendored suite: field dialect, tenant isolation, sub-scopes
+../backend/memory-service/.venv-test/bin/python scripts/run_contract_suite.py
+# options: --port 8123 --watch   (keep serving to curl by hand)
+```
+
 ## License
 
 MIT — see `LICENSE`.

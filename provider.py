@@ -7,7 +7,7 @@ Implements the lifecycle mapping pinned in ../HERMES_MEMORY_PLUGIN_PLAN.md §3:
 - sync_turn         → background ingest via ``spawn_context_thread``
   (catalog-required: contextvars/profile isolation; join-first, one in flight)
 - tools             → loft_recall / loft_remember / loft_forget / loft_stats /
-                      loft_search, JSON-always handlers
+                      loft_search; JSON-always handlers via schemas + client
 - config            → profile-aware secret via get_secret + flat runtime JSON
 
 Everything profile-specific is bound on the instance in initialize(); nothing
@@ -31,9 +31,15 @@ from .client import (
     RateLimited,
     ScopeError,
     ServiceClient,
-    ServiceError,
 )
 from .config_schema import DEFAULT_BASE_URL, FIELDS, runtime_config
+from .schemas import (
+    SYSTEM_PROMPT_BLOCK,
+    friendly_error,
+    shrink,
+    tool_schemas,
+    turn_payload,
+)
 from .scope import resolve_agent_id, resolve_conversation_id
 
 logger = logging.getLogger("hermes.plugins.openloft-memory")
@@ -41,27 +47,16 @@ logger = logging.getLogger("hermes.plugins.openloft-memory")
 PLUGIN_NAME = "openloft-memory"
 CONFIG_FILE = "openloft-memory.json"
 
-_SYNC_JOIN_TIMEOUT = 5.0
-_PREFETCH_BUDGET = 8.0       # wall-clock seconds for a synchronous recall
-
-_TURN_TEMPLATE = [{"role": "user", "content": ""}, {"role": "assistant", "content": ""}]
-
-SYSTEM_PROMPT_BLOCK = """
-Long-term memory is provided by OpenLoft Memory. Relevant memories are
-automatically recalled before each turn; you also have memory tools:
-loft_recall (read what it knows), loft_remember (save a fact), loft_forget
-(stop retrieving a fact — stored data is retained; this is not erasure),
-loft_stats, loft_search. Facts decay on a curve — fading is a feature, not a
-bug.
-""".strip()
+_SYNC_JOIN_TIMEOUT = 5.0   # how long a turn's ingest waits for its predecessor
+# The recall wall budget is enforced by the client's per-socket timeout
+# (DEFAULT_TIMEOUTS["recall"]); this constant is documentation, not enforcement.
+_PREFETCH_BUDGET_SECONDS = 8.0
 
 
-def _shrink(text: str, budget: int) -> str:
-    if len(text) <= budget:
-        return text
-    head = int(budget * 0.7)
-    tail = budget - head
-    return f"{text[:head]}\n…[{len(text) - budget} chars trimmed]…\n{text[-tail:]}"
+def _env(name: str) -> str | None:
+    """Non-secret env knobs only. The key never comes from here (rule 11)."""
+    value = os.environ.get(name)
+    return value if value else None
 
 
 class OpenLoftMemoryProvider(MemoryProvider):
@@ -72,13 +67,11 @@ class OpenLoftMemoryProvider(MemoryProvider):
         self._agent_id = "hermes"
         self._conv_mode = "agent"
         self._cfg: dict = {}
-        self._hermes_home = ""
-        self._platform = "cli"
+        self._identity = ""
         self._context_kind = "primary"
         self._sync_thread: threading.Thread | None = None
-        self._sync_lock = threading.Lock()
 
-    # -- required ABC surface ------------------------------------------------
+    # -- required ABC surface -------------------------------------------------
 
     @property
     def name(self) -> str:
@@ -88,10 +81,11 @@ class OpenLoftMemoryProvider(MemoryProvider):
         """Credential presence only — network-free by contract."""
         try:
             return bool(get_secret("OPENLOFT_MEMORY_API_KEY"))
-        except Exception:  # noqa: BLE001 - secret scope misses never break init
+        except Exception:  # noqa: BLE001 - a secret-scope miss must not break agent init
             return False
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        """Bind-only: no network, no writes. All storage is remote."""
         self._hermes_home = str(kwargs.get("hermes_home") or "")
         self._platform = str(kwargs.get("platform") or "cli")
         self._identity = str(kwargs.get("agent_identity") or "")
@@ -101,14 +95,12 @@ class OpenLoftMemoryProvider(MemoryProvider):
         self._cfg = cfg
         self._agent_id = resolve_agent_id(
             cfg_override=cfg.get("agent_id"),
-            env_id=read_env("OPENLOFT_MEMORY_AGENT_ID"),
+            env_id=_env("OPENLOFT_MEMORY_AGENT_ID"),
             profile_identity=self._identity,
         )
         self._conv_mode = cfg.get("conversation_scope") or "agent"
 
-        base = read_env("OPENLOFT_MEMORY_BASE_URL") or str(
-            cfg.get("base_url") or DEFAULT_BASE_URL
-        )
+        base = _env("OPENLOFT_MEMORY_BASE_URL") or str(cfg.get("base_url") or DEFAULT_BASE_URL)
         key = ""
         try:
             key = get_secret("OPENLOFT_MEMORY_API_KEY") or ""
@@ -123,10 +115,10 @@ class OpenLoftMemoryProvider(MemoryProvider):
         if not self._cfg.get("toolset_enabled", True):
             return []
         scope = self._conversation_scope()
-        sfx = "" if scope is None else f" (this agent: {scope})"
-        return _tool_schemas(sfx)
+        suffix = "" if scope is None else f" (this agent: {scope})"
+        return tool_schemas(suffix)
 
-    # -- lifecycle hooks ------------------------------------------------------
+    # -- lifecycle hooks --------------------------------------------------------
 
     def prefetch(self, query: str, *, session_id: str = "", **kwargs):
         """Synchronous, budgeted, fail-open recall. Returns injectable context."""
@@ -149,8 +141,7 @@ class OpenLoftMemoryProvider(MemoryProvider):
         context = res.get("context") or ""
         if not context.strip():
             return None
-        budget = int(self._cfg.get("inject_budget", 6000))
-        return {"context": _shrink(context, budget)}
+        return {"context": shrink(context, int(self._cfg.get("inject_budget", 6000)))}
 
     def queue_prefetch(self, query: str, *, session_id: str = "", **kwargs) -> None:
         """Fire-and-forget warm-up; result discarded."""
@@ -162,12 +153,12 @@ class OpenLoftMemoryProvider(MemoryProvider):
             logger.debug("openloft-memory: warm skipped (%s)", exc)
 
     def sync_turn(self, user, assistant, *, session_id: str = "", messages=None, **kwargs) -> None:
-        """Non-blocking ingest. join-first, one in flight, never blocks a turn."""
+        """Non-blocking ingest: join-first, one in flight, never blocks a turn."""
         if not self._ready() or not self._cfg.get("ingest_enabled", True):
             return
         if self._context_kind not in {"primary", ""} and not self._cfg.get("ingest_nonprimary"):
             return
-        payload = list(messages) if messages else _turn_template(user, assistant)
+        payload = list(messages) if messages else turn_payload(user, assistant)
         if not payload:
             return
         previous = self._sync_thread
@@ -186,10 +177,10 @@ class OpenLoftMemoryProvider(MemoryProvider):
         if thread is not None:
             try:
                 thread.join(timeout=_SYNC_JOIN_TIMEOUT)
-            except RuntimeError:  # join from same thread
+            except RuntimeError:  # join from the same thread
                 pass
 
-    # -- config write path ----------------------------------------------------
+    # -- config write path -------------------------------------------------------
 
     def save_config(self, values: dict, hermes_home: str) -> None:
         """Persist non-secret settings to our flat JSON (plan §4.1)."""
@@ -201,19 +192,19 @@ class OpenLoftMemoryProvider(MemoryProvider):
         os.replace(tmp, target)
         # Rebind so a runtime change takes effect without a restart.
         self._cfg = runtime_config(values, hermes_home)
-        if client := self._client:
-            base = read_env("OPENLOFT_MEMORY_BASE_URL") or str(
-                self._cfg.get("base_url") or DEFAULT_BASE_URL
-            )
-            client.base_url = base.rstrip("/")
+        if self._client is not None:
+            self._client.base_url = (
+                _env("OPENLOFT_MEMORY_BASE_URL")
+                or str(self._cfg.get("base_url") or DEFAULT_BASE_URL)
+            ).rstrip("/")
 
-    # -- tool calls -------------------------------------------------------------
+    # -- tool calls ----------------------------------------------------------------
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         try:
             return json.dumps(self._dispatch(tool_name, dict(args or {})))
         except Exception as exc:  # noqa: BLE001 - handlers never raise
-            return json.dumps({"error": _friendly(exc)})
+            return json.dumps({"error": friendly_error(exc)})
 
     def _dispatch(self, tool_name: str, args: dict) -> dict:
         if not self._ready():
@@ -254,7 +245,7 @@ class OpenLoftMemoryProvider(MemoryProvider):
         raise ScopeError(f"unknown tool '{tool_name}' — valid: loft_recall, loft_remember, "
                          "loft_forget, loft_stats, loft_search")
 
-    # -- internals ---------------------------------------------------------------
+    # -- internals -------------------------------------------------------------------
 
     def _ready(self) -> bool:
         return bool(self._client and self._client.api_key)
@@ -302,92 +293,8 @@ class OpenLoftMemoryProvider(MemoryProvider):
                 res.get("updates_ingested"), res.get("turn"),
             )
         except RateLimited as exc:
-            logger.warning("openloft-memory: ingest rate-limited, next turn retrains (%s)", exc)
+            logger.warning("openloft-memory: ingest rate-limited (next turn re-sends a "
+                           "fuller transcript); %s", exc)
         except Exception as exc:  # noqa: BLE001 - never fail the turn for memory
-            logger.error("openloft-memory: ingest failed (%s); next turn's fuller "
-                         "transcript is the recovery path", exc)
-
-
-def _turn_template(user: str, assistant: str) -> list:
-    payload = [dict(_TURN_TEMPLATE[0]), dict(_TURN_TEMPLATE[1])]
-    payload[0]["content"] = str(user or "")
-    payload[1]["content"] = str(assistant or "")
-    return [m for m in payload if m["content"]]
-
-
-def _friendly(exc: Exception) -> str:
-    if isinstance(exc, NotProvisioned):
-        return f"{exc} — mint a memory key from the dashboard, or check your key"
-    if isinstance(exc, RateLimited):
-        return f"{exc} — slow down and retry shortly"
-    if isinstance(exc, ScopeError):
-        return str(exc)
-    return str(exc) or type(exc).__name__
-
-
-def read_env(name: str) -> str | None:
-    """Non-secret env knobs only. The key never comes from here (rule 11)."""
-    value = os.environ.get(name)
-    return value if value else None
-
-
-def _tool_schemas(agent_suffix: str) -> list:
-    """Model-facing schemas. Honest verbs: forget INVALIDATES, it does not erase."""
-    return [
-        {
-            "name": "loft_recall",
-            "description": f"Retrieve relevant long-term memory for a query. "
-                           f"Read-only, no side effects.{agent_suffix}",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "What to look up"},
-                    "top_k": {"type": "integer", "description": "Max hits (default 8)"},
-                },
-                "required": ["query"],
-            },
-        },
-        {
-            "name": "loft_remember",
-            "description": "Persist a fact for later recall across sessions "
-                           "(costs one extraction call server-side).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "The fact to remember"},
-                },
-                "required": ["text"],
-            },
-        },
-        {
-            "name": "loft_forget",
-            "description": "Make a stored fact stop being retrieved "
-                           "(temporal invalidation — the data is retained, not deleted).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "entity_name": {"type": "string",
-                                    "description": "Forget all facts about this entity"},
-                    "record_id": {"type": "string", "description": "Forget one record"},
-                },
-                "required": [],
-            },
-        },
-        {
-            "name": "loft_stats",
-            "description": f"Memory store status: turn number and record counts.{agent_suffix}",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-        {
-            "name": "loft_search",
-            "description": "Scored vector search over stored memory records.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "limit": {"type": "integer", "description": "Max results (default 10)"},
-                },
-                "required": ["query"],
-            },
-        },
-    ]
+            logger.error("openloft-memory: ingest failed (%s); the next turn's "
+                         "fuller transcript is the recovery path", exc)

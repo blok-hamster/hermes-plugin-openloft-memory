@@ -1,65 +1,214 @@
-"""Provider contract tests — run only inside a Hermes environment.
+"""Provider behavior tests.
 
-Outside Hermes the ``agent.*`` modules do not exist, so the whole module
-skips (phase-1 tasks 1.8–1.9 run these against a real hermes install).
+The conftest installs documented agent.* stand-ins when Hermes is absent, so
+the pure plumbing (availability gate, tool visibility, fail-open reads,
+non-blocking ingest, config binding) runs on any machine. Tests whose VALUE
+depends on real Hermes semantics (contextvars-bound threads, profile-scoped
+secrets, the MemoryManager flow) are marked ``real_hermes`` and skipped
+outside a genuine Hermes installation; they run in gate phase 1.9.
 """
+
+import json
 
 import pytest
 
+from openloft_memory.client import ServiceClient
+from openloft_memory.provider import OpenLoftMemoryProvider
+from stubserver import serve_stub
+
 try:
-    import agent.memory_provider as _amp  # noqa: F401
     from agent.memory_provider import MemoryManager  # noqa: F401
-    HAS_HERMES = True
+    HAS_REAL_HERMES = True
 except Exception:  # noqa: BLE001
-    HAS_HERMES = False
+    HAS_REAL_HERMES = False
 
-pytestmark = pytest.mark.skipif(not HAS_HERMES, reason="Hermes runtime not present")
-
-
-def _provider():
-    from openloft_memory.provider import OpenLoftMemoryProvider
-    return OpenLoftMemoryProvider()
+real_hermes = pytest.mark.skipif(
+    not HAS_REAL_HERMES, reason="needs a real Hermes installation (phase-1 gate 1.9)")
 
 
-def test_is_available_false_without_key(monkeypatch):
-    monkeypatch.delenv("OPENLOFT_MEMORY_API_KEY", raising=False)
-    assert _provider().is_available() is False
-
-
-def test_name_is_fixed():
-    assert _provider().name == "openloft-memory"
-
-
-def test_tools_hidden_when_toolset_disabled(monkeypatch, tmp_path):
-    prov = _provider()
-    import json, pathlib
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    (home / "openloft-memory.json").write_text(json.dumps({"toolset_enabled": False}))
-    prov._hermes_home = str(home)
-    prov._cfg = prov._load_runtime_config()
-    assert prov.get_tool_schemas() == []
-
-
-def test_prefetch_fails_open_when_client_unconfigured(monkeypatch):
-    prov = _provider()
-    monkeypatch.setattr(prov, "_ready", lambda: False)
-    assert prov.prefetch("anything") is None
-
-
-def test_sync_turn_never_blocks_on_backend_failure():
-    """Fail-visible: the turn keeps flowing; the ingest logs the failure.
-
-    Runs inside a Hermes environment only (module-level skip), where
-    ``spawn_context_thread`` exists.
-    """
-    from openloft_memory.client import ServiceClient
-
-    prov = _provider()
+def provider(monkeypatch=None, cfg: dict | None = None):
+    """A provider bound to a stub server; the key is the widget-key one."""
+    url, httpd = serve_stub()
+    prov = OpenLoftMemoryProvider()
+    prov._hermes_home = ""
+    prov._identity = "probe"
+    if monkeypatch is not None:
+        monkeypatch.delenv("OPENLOFT_MEMORY_API_KEY", raising=False)
+    prov._cfg = {"top_k": 8, "inject_budget": 6000, "ingest_enabled": True,
+                 "toolset_enabled": True, "warm_next_turn": True,
+                 "conversation_scope": "agent", **(cfg or {})}
     prov._agent_id = "probe"
-    prov._cfg = {"ingest_enabled": True, "conversation_scope": "agent"}
-    prov._client = ServiceClient(base_url="http://127.0.0.1:1/v1/memory", api_key="k")
-    prov.sync_turn("u", "a")            # must raise nothing
-    thread = prov._sync_thread
-    assert thread is not None
-    thread.join(timeout=5.0)            # an unreachable backend curls up, no hang
+    prov._client = ServiceClient(base_url=url, api_key="nmafc_probe.secret")
+    return prov, httpd
+
+
+def with_key(monkeypatch, value):
+    if monkeypatch is not None:
+        monkeypatch.setenv("OPENLOFT_MEMORY_API_KEY", value)
+
+
+class TestAvailabilityGate:
+    def test_false_when_keyless(self, monkeypatch):
+        monkeypatch.delenv("OPENLOFT_MEMORY_API_KEY", raising=False)
+        assert OpenLoftMemoryProvider().is_available() is False
+
+    def test_true_when_key_present_in_scope(self, monkeypatch):
+        with_key(monkeypatch, "nmafc_t.k")
+        assert OpenLoftMemoryProvider().is_available() is True
+
+    def test_initialize_is_network_free(self, monkeypatch, tmp_path):
+        """initialize may not touch the network (contract of the ABC)."""
+        with_key(monkeypatch, "nmafc_t.k")
+        prov = OpenLoftMemoryProvider()
+        prov.initialize("sess-1", hermes_home=str(tmp_path), platform="cli",
+                        agent_identity="work")     # no server → must not raise
+        assert prov._agent_id == "work"
+
+
+class TestToolSurface:
+    def test_five_tools_by_default(self):
+        prov, httpd = provider()
+        try:
+            names = [s["name"] for s in prov.get_tool_schemas()]
+            assert names == ["loft_recall", "loft_remember", "loft_forget",
+                             "loft_stats", "loft_search"]
+        finally:
+            httpd.shutdown()
+
+    def test_toolset_disabled_hides_tools(self, monkeypatch):
+        prov, httpd = provider(monkeypatch, cfg={"toolset_enabled": False})
+        try:
+            assert prov.get_tool_schemas() == []
+        finally:
+            httpd.shutdown()
+
+
+class TestPrefetch:
+    def test_fail_open_without_client(self, monkeypatch):
+        monkeypatch.delenv("OPENLOFT_MEMORY_API_KEY", raising=False)
+        prov, httpd = provider()
+        httpd.shutdown()
+        prov._client = None
+        assert prov.prefetch("anything") is None
+
+    def test_fail_open_on_unreachable_backend(self):
+        prov, httpd = provider()
+        httpd.shutdown()
+        prov._client = ServiceClient(base_url="http://127.0.0.1:1/v1/memory",
+                                     api_key="nmafc_probe.secret")
+        assert prov.prefetch("anything") is None
+
+    def test_no_injection_when_store_is_empty(self):
+        prov, httpd = provider()
+        try:
+            res = prov.prefetch("what do I know")
+            assert res is None or isinstance(res, dict)   # empty context → None
+            if res is not None:
+                assert "context" in res
+        finally:
+            httpd.shutdown()
+
+
+class TestSyncTurn:
+    def test_never_blocks_on_unreachable_backend(self):
+        prov, httpd = provider()
+        httpd.shutdown()
+        prov._client = ServiceClient(base_url="http://127.0.0.1:1/v1/memory",
+                                     api_key="nmafc_probe.secret")
+        prov.sync_turn("u", "a")            # must raise nothing
+        thread = prov._sync_thread
+        assert thread is not None
+        thread.join(timeout=5.0)            # bounded — a hang fails the test
+
+    def test_ingest_disabled_is_a_noop(self):
+        prov, httpd = provider(cfg={"ingest_enabled": False})
+        httpd.shutdown()
+        prov._client = ServiceClient(base_url="http://127.0.0.1:1/v1/memory",
+                                     api_key="k")
+        prov.sync_turn("u", "a")
+        assert prov._sync_thread is None
+
+
+class TestNonprimaryContexts:
+    def test_cron_ingest_skipped_unless_opted_in(self):
+        prov, httpd = provider()
+        httpd.shutdown()
+        prov._client = ServiceClient(base_url="http://127.0.0.1:1/v1/memory",
+                                     api_key="k")
+        prov._context_kind = "cron"
+        prov.sync_turn("u", "a")
+        assert prov._sync_thread is None
+        prov._cfg["ingest_nonprimary"] = True
+        prov.sync_turn("u", "a")
+        assert prov._sync_thread is not None
+        prov._sync_thread.join(timeout=5)
+
+
+class TestToolDispatch:
+    def test_unready_returns_error_json_never_raises(self, monkeypatch):
+        monkeypatch.delenv("OPENLOFT_MEMORY_API_KEY", raising=False)
+        prov, httpd = provider()
+        httpd.shutdown()
+        prov._client = None
+        out = json.loads(prov.handle_tool_call("loft_stats", {}))
+        assert "error" in out
+
+    def test_unknown_tool_lists_valid_tools(self, monkeypatch):
+        monkeypatch.setenv("OPENLOFT_MEMORY_API_KEY", "nmafc_probe.secret")
+        prov, httpd = provider()
+        try:
+            out = json.loads(prov.handle_tool_call("loft_nonsense", {}))
+            assert "loft_recall" in out["error"]
+        finally:
+            httpd.shutdown()
+
+    def test_dispatch_hits_substrate_json_always(self, monkeypatch):
+        monkeypatch.setenv("OPENLOFT_MEMORY_API_KEY", "nmafc_probe.secret")
+        prov, httpd = provider()
+        try:
+            out = json.loads(prov.handle_tool_call("loft_stats", {}))
+            assert out.get("ok") is True or "error" in out
+        finally:
+            httpd.shutdown()
+
+
+class TestConfigBinding:
+    def test_scope_mode_read_from_runtime_config(self, monkeypatch, tmp_path):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "openloft-memory.json").write_text(json.dumps({"base_url": "http://x:1/v1/memory"}))
+        with_key(monkeypatch, "nmafc_t.k")
+        prov = OpenLoftMemoryProvider()
+        prov.initialize("s", hermes_home=str(home))
+        assert prov._cfg["base_url"] == "http://x:1/v1/memory"
+
+    def test_agent_id_resolution_lives_on_the_instance(self, monkeypatch, tmp_path):
+        prof_a, prof_b = tmp_path / "a", tmp_path / "b"
+        prof_a.mkdir(); prof_b.mkdir()
+        with_key(monkeypatch, "nmafc_t.k")
+        one = OpenLoftMemoryProvider()
+        one.initialize("s", hermes_home=str(prof_a), agent_identity="alpha")
+        two = OpenLoftMemoryProvider()
+        two.initialize("s", hermes_home=str(prof_b), agent_identity="beta")
+        assert one._agent_id == "alpha" and two._agent_id == "beta"
+
+
+@real_hermes
+class TestMemoryManagerFlow:
+    """The upstream contract flow: manager-driven, real Hermes semantics."""
+
+    def test_manager_round_trip(self, monkeypatch):
+        with_key(monkeypatch, "nmafc_probe.secret")
+        from agent.memory_manager import MemoryManager
+
+        prov, httpd = provider()
+        try:
+            mgr = MemoryManager()
+            mgr.add_provider(prov)
+            mgr.initialize_all(session_id="test-1", hermes_home="/tmp", platform="cli")
+            mgr.handle_tool_call("loft_stats", {})
+            mgr.sync_all("u", "a")
+            mgr.on_session_end([])
+            mgr.shutdown_all()
+        finally:
+            httpd.shutdown()

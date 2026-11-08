@@ -19,13 +19,7 @@ import urllib.request
 from urllib.parse import urlparse
 
 import pytest
-
-from openloft_memory.client import (
-    NotProvisioned,
-    ScopeError,
-    ServiceClient,
-    ServiceErrorCatchall,
-)
+from openloft_memory.client import ServiceClient
 
 BASE = os.environ.get("OPENLOFT_MEMORY_TEST_URL", "http://127.0.0.1:8100/v1/memory")
 
@@ -92,9 +86,11 @@ class TestIsolation:
             mine.get("tenant") is None and other.get("tenant") is None
         )
 
-    def test_header_cannot_move_the_tenant(self):
-        import urllib.request
-
+    def test_header_moves_subscope_never_tenancy(self):
+        """X-Agent-Id names an agent sub-scope INSIDE the caller's tenant
+        (tenancy.agent_of accepts it by design); no header can move the
+        tenant binding itself, which lives in the credential."""
+        ours = client("acme").stats(agent_id="isol")
         key = _keys().get("acme", "x")
         raw = urllib.request.Request(
             BASE + "/stats",
@@ -103,11 +99,38 @@ class TestIsolation:
         )
         with urllib.request.urlopen(raw, timeout=5) as resp:
             body = json.loads(resp.read())
-        assert body.get("agent_id") in (None, "isol")  # never another tenant's scope
+        assert body.get("tenant") == ours.get("tenant")      # tenancy follows the key
+        assert body.get("agent_id") == "cross_tenant_attempt"  # only the sub-scope moved
 
-    def test_hostile_record_id_stays_in_tenant(self):
-        with pytest.raises((ScopeError, ServiceErrorCatchall, NotProvisioned)):
-            client("acme").forget(agent_id="isol", record_id="x' OR '1'='1")
+    @pytest.mark.xfail(
+        strict=True,
+        reason="substrate finding F1: POST /forget does not allowlist record_id/"
+               "entity_name (engine predicate reached, 200 forgiven:false) — "
+               "observed 2026-11-08; the plugin's client refuses these values "
+               "before the wires (see TODO in ../INTEGRATION.md)",
+    )
+    def test_hostile_record_id_at_the_server(self):
+        """Server-side posture for a predicate-injection record id.
+
+        The plugin's client refuses these values before the wires (charset
+        guard); this observes what the bare substrate does if a caller
+        bypasses it. Anything other than a refusal is a finding, because the
+        engine splices record ids into a shared-table predicate.
+        """
+        key = _keys().get("acme", "x")
+        raw = urllib.request.Request(
+            BASE + "/forget",
+            data=json.dumps({"record_id": "x' OR '1'='1", "agent_id": "isol"}).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {key}"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(raw, timeout=10)
+            pytest.fail("forget served a hostile record_id — 400/502 expected; "
+                        "a 200 means the engine predicate was reached (finding)")
+        except urllib.error.HTTPError as exc:
+            assert exc.code in (400, 502), f"unexpected status {exc.code}"
 
 
 class TestSubScopeCharset:
