@@ -77,6 +77,8 @@ variables, so profile isolation holds under multiplexed gateways.
 | `ingest_enabled` | `true` | Persist turns. Non-primary agent contexts (cron, subagents) are skipped unless `ingest_nonprimary` is set |
 | `toolset_enabled` | `true` | Expose the `loft_*` tools |
 | `warm_next_turn` | `true` | Cheap background recall after each turn to keep the backend's store instance warm |
+| `pre_compress_archive` | `false` | **Phase 3**: archive transcript evidence before context compression via `on_pre_compress`, idempotent by content digest; forced when Hermes sets `require_checkpoint` (`compression.checkpoint_required: true`) |
+| `memory_write_mirror` | `false` | **Phase 3**: mirror explicit MEMORY.md / USER.md writes into OpenLoft via `on_memory_write`; destructive writes are skipped when no `previous_content` is seen |
 
 ## Self-hosting
 
@@ -121,6 +123,18 @@ Things you would want to know before installing:
   the active Hermes profile name → `hermes`; conversation ids are sanitized
   into the substrate's `[A-Za-z0-9_-]` charset with a None-omission for the
   default pool.
+- **Phase 3 hardening hooks** (stub-verified; Hermes verification pending the
+  1.9 session):
+  - `on_pre_compress(messages, *, require_checkpoint=False)` — digests the
+    transcript (SHA-256), persists it via `remember` only when
+    `pre_compress_archive` or `require_checkpoint` is set, and skips identical
+    digests (client-side idempotency). Compression never blocks on it.
+  - `on_memory_write(action, target, content, metadata=None)` — mirrors
+    MEMORY.md / USER.md edits into OpenLoft when `memory_write_mirror` is set;
+    destructive writes (edit/delete/replace) are skipped unless
+    `previous_content` is present.
+  - Timing: every client call logs duration (ms) and outcome (ok /
+    rate-limited / error).
 
 ## Development
 

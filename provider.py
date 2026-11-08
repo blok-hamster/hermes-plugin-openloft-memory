@@ -9,6 +9,11 @@ Implements the lifecycle mapping pinned in ../HERMES_MEMORY_PLUGIN_PLAN.md §3:
 - tools             → loft_recall / loft_remember / loft_forget / loft_stats /
                       loft_search; JSON-always handlers via schemas + client
 - config            → profile-aware secret via get_secret + flat runtime JSON
+- phase 3 hooks     → on_pre_compress (digest-keyed, idempotent transcript
+                      archive, opt-in flag + require_checkpoint) and
+                      on_memory_write (MEMORY.md/USER.md mirroring with
+                      previous_content guard); both stub-verified; Hermes
+                      verification pending gate 1.9
 
 Everything profile-specific is bound on the instance in initialize(); nothing
 is stored at module or class level (multiplexed-gateway rule).
@@ -16,10 +21,12 @@ is stored at module or class level (multiplexed-gateway rule).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
 # Documented Hermes surfaces only (catalog rule 9).
@@ -63,6 +70,10 @@ def _env(name: str) -> str | None:
     return value if value else None
 
 
+def _elapsed_ms(start: float) -> int:
+    return int((time.monotonic() - start) * 1000)
+
+
 class OpenLoftMemoryProvider(MemoryProvider):
     """Fail-open reads, fail-visible writes, profile-isolated by construction."""
 
@@ -74,6 +85,8 @@ class OpenLoftMemoryProvider(MemoryProvider):
         self._identity = ""
         self._context_kind = "primary"
         self._sync_thread: threading.Thread | None = None
+        self._checkpoint_digests: dict[str, str] = {}
+        self._write_digests: dict[str, str] = {}
 
     # -- required ABC surface -------------------------------------------------
 
@@ -129,6 +142,7 @@ class OpenLoftMemoryProvider(MemoryProvider):
         if not self._ready():
             return None
         assert self._client is not None
+        started = time.monotonic()
         try:
             res = self._client.recall(
                 query[:4000],
@@ -137,11 +151,14 @@ class OpenLoftMemoryProvider(MemoryProvider):
                 conversation_id=self._conversation_scope(session_id),
             )
         except NotProvisioned as exc:
-            logger.warning("openloft-memory: not provisioned — %s", exc)
+            logger.warning("openloft-memory: not provisioned (%s ms) — %s",
+                           _elapsed_ms(started), exc)
             return None
         except Exception as exc:  # noqa: BLE001 - fail-open reads
-            logger.warning("openloft-memory: prefetch degraded (%s)", exc)
+            logger.warning("openloft-memory: prefetch degraded (%s ms) (%s)",
+                           _elapsed_ms(started), exc)
             return None
+        logger.debug("openloft-memory: prefetch ok (%s ms)", _elapsed_ms(started))
 
         context = res.get("context") or ""
         if not context.strip():
@@ -179,13 +196,114 @@ class OpenLoftMemoryProvider(MemoryProvider):
     def on_session_end(self, messages, **kwargs) -> None:
         """Turn-level ingest already persisted; nothing to flush in v1."""
 
-    def shutdown(self) -> None:
+    def shutdown(self, **kwargs) -> None:
         thread = self._sync_thread
         if thread is not None:
             try:
                 thread.join(timeout=_SYNC_JOIN_TIMEOUT)
             except RuntimeError:  # join from the same thread
                 pass
+
+    # -- phase 3 hardening hooks ----------------------------------------------
+
+    def on_pre_compress(self, messages: list, *, require_checkpoint: bool = False,
+                        conversation_id: str | None = None, **kwargs) -> dict | None:
+        """Archive transcript evidence before context compression (Phase 3, 3.1).
+
+        The transcript is hashed to a content digest and persisted via
+        ``remember``; identical digests are skipped (client-side idempotency).
+        Archiving is opt-in through ``pre_compress_archive`` unless Hermes sets
+        ``require_checkpoint`` (``compression.checkpoint_required: true``),
+        which forces the write. Fail-visible: errors are logged, compression
+        never blocks on this hook.
+        """
+        if not self._ready():
+            return {"checkpointed": False, "skipped": "not_ready"}
+        archive = bool(self._cfg.get("pre_compress_archive")) or require_checkpoint
+        if not archive:
+            return {"checkpointed": False, "skipped": "opt_out"}
+        try:
+            canonical = json.dumps(messages, sort_keys=True,
+                                   separators=(",", ":"))
+            digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        except (TypeError, ValueError) as exc:  # noqa: BLE001
+            logger.warning("openloft-memory: checkpoint digest failed (%s)", exc)
+            return {"checkpointed": False, "error": "digest"}
+        conv = (conversation_id or self._conversation_scope("")) or ""
+        if self._checkpoint_digests.get(conv) == digest:
+            return {"checkpointed": False, "skipped": "duplicate",
+                    "digest": digest[:12]}
+        started = time.monotonic()
+        try:
+            assert self._client is not None
+            self._client.remember(
+                list(messages),
+                agent_id=self._agent_id,
+                conversation_id=conv,
+            )
+            self._checkpoint_digests[conv] = digest
+            logger.info("openloft-memory: checkpoint archived %s (%s ms)",
+                        digest[:12], _elapsed_ms(started))
+            return {"checkpointed": True, "digest": digest}
+        except RateLimited as exc:
+            logger.warning("openloft-memory: checkpoint rate-limited (%s)", exc)
+            return {"checkpointed": False, "error": "rate_limited"}
+        except Exception as exc:  # noqa: BLE001 - archive never blocks compression
+            logger.error("openloft-memory: checkpoint failed (%s); compression "
+                         "proceeds without this archive", exc)
+            return {"checkpointed": False, "error": str(exc)}
+
+    def on_memory_write(self, action: str, target: str, content: str,
+                        metadata: dict | None = None, **kwargs) -> dict | None:
+        """Mirror explicit memory writes (MEMORY.md / USER.md edits) into
+        OpenLoft as searchable records (Phase 3, 3.2).
+
+        Destructive writes (edit/delete/replace) are skipped when
+        ``previous_content`` is absent — we can't diff what we haven't seen.
+        Opt-in through ``memory_write_mirror``.
+        """
+        if not self._cfg.get("memory_write_mirror", False):
+            return {"mirrored": False, "skipped": "opt_out"}
+        if not self._ready():
+            return {"mirrored": False, "skipped": "not_ready"}
+        meta = metadata or {}
+        destructive = str(action).lower() in {"edit", "delete",
+                                              "remove", "replace"}
+        if destructive and meta.get("previous_content") is None:
+            return {"mirrored": False, "skipped": "unsafe_without_prior"}
+        canonical = json.dumps([action, target, content], sort_keys=True,
+                               separators=(",", ":"))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        conv = (self._conversation_scope("")) or ""
+        if self._write_digests.get(conv) == digest:
+            return {"mirrored": False, "skipped": "duplicate",
+                    "digest": digest[:12]}
+        prior = meta.get("previous_content")
+        payload = [
+            {"role": "system",
+             "content": ("openloft-memory-write %s %s%s"
+                         % (action, target,
+                            (" | prior: " + str(prior)[:200]) if prior else ""))},
+            {"role": "user", "content": str(content)[:20000]},
+        ]
+        started = time.monotonic()
+        try:
+            assert self._client is not None
+            self._client.remember(
+                payload,
+                agent_id=self._agent_id,
+                conversation_id=conv,
+            )
+            self._write_digests[conv] = digest
+            logger.info("openloft-memory: mirrored %s %s (%s ms)",
+                        action, target, _elapsed_ms(started))
+            return {"mirrored": True, "digest": digest}
+        except RateLimited as exc:
+            logger.warning("openloft-memory: write mirror rate-limited (%s)", exc)
+            return {"mirrored": False, "error": "rate_limited"}
+        except Exception as exc:  # noqa: BLE001 - never fail a user write for memory
+            logger.error("openloft-memory: write mirror failed (%s)", exc)
+            return {"mirrored": False, "error": str(exc)}
 
     # -- config write path -------------------------------------------------------
 
@@ -223,37 +341,58 @@ class OpenLoftMemoryProvider(MemoryProvider):
         assert self._client is not None
         conversation_id = self._conversation_scope(str(args.get("_session_id") or ""))
         if tool_name == "loft_recall":
-            return self._client.recall(
+            started = time.monotonic()
+            res = self._client.recall(
                 str(args.get("query") or ""),
                 agent_id=self._agent_id,
                 top_k=int(args.get("top_k") or self._cfg.get("top_k", 8)),
                 conversation_id=conversation_id,
             )
+            logger.debug("openloft-memory: tool loft_recall ok (%s ms)",
+                         _elapsed_ms(started))
+            return res
         if tool_name == "loft_remember":
             text = str(args.get("text") or "").strip()
             if not text:
                 raise ScopeError("loft_remember needs text to remember")
-            return self._client.remember(
+            started = time.monotonic()
+            res = self._client.remember(
                 [{"role": "user", "content": text[:20000]}],
                 agent_id=self._agent_id,
                 conversation_id=conversation_id,
             )
+            logger.debug("openloft-memory: tool loft_remember ok (%s ms)",
+                         _elapsed_ms(started))
+            return res
         if tool_name == "loft_forget":
-            return self._client.forget(
+            started = time.monotonic()
+            res = self._client.forget(
                 agent_id=self._agent_id,
                 entity_name=args.get("entity_name"),
                 record_id=args.get("record_id"),
                 conversation_id=conversation_id,
             )
+            logger.debug("openloft-memory: tool loft_forget ok (%s ms)",
+                         _elapsed_ms(started))
+            return res
         if tool_name == "loft_stats":
-            return self._client.stats(agent_id=self._agent_id, conversation_id=conversation_id)
+            started = time.monotonic()
+            res = self._client.stats(agent_id=self._agent_id,
+                                     conversation_id=conversation_id)
+            logger.debug("openloft-memory: tool loft_stats ok (%s ms)",
+                         _elapsed_ms(started))
+            return res
         if tool_name == "loft_search":
-            return self._client.search(
+            started = time.monotonic()
+            res = self._client.search(
                 str(args.get("query") or ""),
                 agent_id=self._agent_id,
                 limit=int(args.get("limit") or 10),
                 conversation_id=conversation_id,
             )
+            logger.debug("openloft-memory: tool loft_search ok (%s ms)",
+                         _elapsed_ms(started))
+            return res
         raise ScopeError(f"unknown tool '{tool_name}' — valid: loft_recall, loft_remember, "
                          "loft_forget, loft_stats, loft_search")
 
@@ -300,6 +439,7 @@ class OpenLoftMemoryProvider(MemoryProvider):
         if not self._ready():
             return
         assert self._client is not None
+        started = time.monotonic()
         try:
             self._client.recall(
                 query[:4000],
@@ -307,8 +447,9 @@ class OpenLoftMemoryProvider(MemoryProvider):
                 top_k=int(self._cfg.get("top_k", 8)),
                 conversation_id=self._conversation_scope(session_id),
             )
+            logger.debug("openloft-memory: warm ok (%s ms)", _elapsed_ms(started))
         except Exception:  # noqa: BLE001 - warm-up is best-effort
-            pass
+            logger.debug("openloft-memory: warm skipped (%s ms)", _elapsed_ms(started))
 
     def _ingest(self, payload: list, session_id: str, previous: threading.Thread | None) -> None:
         if previous is not None:
@@ -319,6 +460,7 @@ class OpenLoftMemoryProvider(MemoryProvider):
         if not self._ready():
             return
         assert self._client is not None
+        started = time.monotonic()
         try:
             res = self._client.remember(
                 payload,
@@ -326,12 +468,14 @@ class OpenLoftMemoryProvider(MemoryProvider):
                 conversation_id=self._conversation_scope(session_id),
             )
             logger.info(
-                "openloft-memory: ingested %s updates (turn %s)",
+                "openloft-memory: ingested %s updates (turn %s, %s ms)",
                 res.get("updates_ingested"), res.get("turn"),
+                _elapsed_ms(started),
             )
         except RateLimited as exc:
             logger.warning("openloft-memory: ingest rate-limited (next turn re-sends a "
                            "fuller transcript); %s", exc)
         except Exception as exc:  # noqa: BLE001 - never fail the turn for memory
-            logger.error("openloft-memory: ingest failed (%s); the next turn's "
-                         "fuller transcript is the recovery path", exc)
+            logger.error("openloft-memory: ingest failed (%s ms) (%s); the next turn's "
+                         "fuller transcript is the recovery path",
+                         _elapsed_ms(started), exc)

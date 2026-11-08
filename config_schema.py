@@ -84,6 +84,12 @@ FIELDS = [
                        "(Phase 3 — fail-closed under compression.checkpoint_required)",
         "default": False,
     },
+    {
+        "key": "memory_write_mirror",
+        "description": "Mirror explicit memory writes (MEMORY.md / USER.md "
+                       "edits) into OpenLoft as searchable records (Phase 3)",
+        "default": False,
+    },
 ]
 
 RUNTIME_DEFAULTS = {

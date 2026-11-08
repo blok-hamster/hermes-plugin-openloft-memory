@@ -9,12 +9,13 @@ outside a genuine Hermes installation; they run in gate phase 1.9.
 """
 
 import json
+import logging
 
 import pytest
 
 from openloft_memory.client import ServiceClient
 from openloft_memory.provider import OpenLoftMemoryProvider
-from stubserver import serve_stub
+from stubserver import serve_stub, SubstrateStub
 
 try:
     from agent.memory_provider import MemoryManager  # noqa: F401
@@ -246,6 +247,133 @@ class TestSpawnSemantics:
         finally:
             prov_mod.spawn_context_thread = real_spawn
         assert not prov._sync_thread.is_alive()
+
+
+class TestPhase3Hardening:
+    """Checkpoint archive (3.1) + write mirroring (3.2), stub-server only."""
+
+    _MSGS = [{"role": "user", "content": "remember that I like dark mode"},
+             {"role": "assistant", "content": "noted"}]
+
+    def test_checkpoint_skipped_when_opted_out(self):
+        prov, httpd = provider()
+        try:
+            SubstrateStub.seen = {}
+            assert prov.on_pre_compress(self._MSGS) == {
+                "checkpointed": False, "skipped": "opt_out"}
+            assert SubstrateStub.seen == {}   # nothing sent to the substrate
+        finally:
+            httpd.shutdown()
+
+    def test_checkpoint_archives_when_flag_on(self, caplog):
+        prov, httpd = provider(cfg={"pre_compress_archive": True})
+        caplog.set_level(logging.INFO)
+        try:
+            SubstrateStub.seen = {}
+            res = prov.on_pre_compress(self._MSGS)
+            assert res["checkpointed"] is True
+            digest = res["digest"]
+            assert len(digest) == 64     # SHA-256 hex
+            body = SubstrateStub.seen["body"]
+            assert body["messages"] == self._MSGS
+            assert body["agent_id"] == "probe"
+            assert body.get("conversation_id") in (None, "")   # agent scope: default pool
+            assert any("checkpoint archived" in r.getMessage() for r in caplog.records)
+        finally:
+            httpd.shutdown()
+
+    def test_checkpoint_requires_checkpoint_forces_archive(self):
+        prov, httpd = provider()
+        try:
+            SubstrateStub.seen = {}
+            res = prov.on_pre_compress(self._MSGS, require_checkpoint=True)
+            assert res["checkpointed"] is True
+            assert SubstrateStub.seen["body"]["messages"] == self._MSGS
+        finally:
+            httpd.shutdown()
+
+    def test_checkpoint_idempotent_by_digest(self):
+        prov, httpd = provider(cfg={"pre_compress_archive": True})
+        try:
+            SubstrateStub.seen = {}
+            first = prov.on_pre_compress(self._MSGS)
+            assert first["checkpointed"] is True
+            second = prov.on_pre_compress(self._MSGS)
+            assert second["checkpointed"] is False
+            assert second["skipped"] == "duplicate"
+            assert second["digest"] == first["digest"][:12]
+            assert SubstrateStub.seen["body"]["messages"] == self._MSGS  # no second request overwrote it
+        finally:
+            httpd.shutdown()
+
+    def test_checkpoint_not_ready(self):
+        prov, httpd = provider()
+        httpd.shutdown()
+        prov._client = None
+        assert prov.on_pre_compress(self._MSGS) == {
+            "checkpointed": False, "skipped": "not_ready"}
+
+    def test_write_mirror_skipped_when_opted_out(self):
+        prov, httpd = provider()
+        try:
+            SubstrateStub.seen = {}
+            assert prov.on_memory_write("create", "MEMORY.md", "# hi") == {
+                "mirrored": False, "skipped": "opt_out"}
+            assert SubstrateStub.seen == {}
+        finally:
+            httpd.shutdown()
+
+    def test_write_mirror_mirrors_create(self, caplog):
+        prov, httpd = provider(cfg={"memory_write_mirror": True})
+        caplog.set_level(logging.INFO)
+        try:
+            SubstrateStub.seen = {}
+            res = prov.on_memory_write("create", "USER.md", "# profile")
+            assert res["mirrored"] is True
+            body = SubstrateStub.seen["body"]
+            assert body["messages"][0]["role"] == "system"
+            assert "openloft-memory-write create USER.md" in body["messages"][0]["content"]
+            assert body["messages"][1]["content"] == "# profile"
+            assert any("mirrored create USER.md" in r.getMessage() for r in caplog.records)
+        finally:
+            httpd.shutdown()
+
+    def test_write_mirror_skips_destructive_without_prior(self):
+        prov, httpd = provider(cfg={"memory_write_mirror": True})
+        try:
+            SubstrateStub.seen = {}
+            res = prov.on_memory_write("edit", "MEMORY.md", "# new")
+            assert res == {"mirrored": False, "skipped": "unsafe_without_prior"}
+            assert SubstrateStub.seen == {}
+        finally:
+            httpd.shutdown()
+
+    def test_write_mirror_mirrors_destructive_with_prior(self):
+        prov, httpd = provider(cfg={"memory_write_mirror": True})
+        try:
+            SubstrateStub.seen = {}
+            res = prov.on_memory_write("edit", "MEMORY.md", "# new",
+                                       metadata={"previous_content": "# old"})
+            assert res["mirrored"] is True
+            assert "prior: # old" in SubstrateStub.seen["body"]["messages"][0]["content"]
+        finally:
+            httpd.shutdown()
+
+    def test_write_mirror_not_ready(self):
+        prov, httpd = provider(cfg={"memory_write_mirror": True})
+        httpd.shutdown()
+        prov._client = None
+        assert prov.on_memory_write("create", "MEMORY.md", "# hi") == {
+            "mirrored": False, "skipped": "not_ready"}
+
+    def test_checkpoint_uses_passed_conversation_id(self):
+        prov, httpd = provider(cfg={"pre_compress_archive": True})
+        try:
+            SubstrateStub.seen = {}
+            prov.on_pre_compress(self._MSGS, conversation_id="sess-1")
+            assert SubstrateStub.seen["body"]["conversation_id"] == "sess-1"
+        finally:
+            httpd.shutdown()
 
 
 @real_hermes
