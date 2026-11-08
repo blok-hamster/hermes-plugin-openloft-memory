@@ -128,6 +128,7 @@ class OpenLoftMemoryProvider(MemoryProvider):
         """Synchronous, budgeted, fail-open recall. Returns injectable context."""
         if not self._ready():
             return None
+        assert self._client is not None
         try:
             res = self._client.recall(
                 query[:4000],
@@ -219,6 +220,7 @@ class OpenLoftMemoryProvider(MemoryProvider):
     def _dispatch(self, tool_name: str, args: dict) -> dict:
         if not self._ready():
             raise NotProvisioned("memory backend is not configured or keyless")
+        assert self._client is not None
         conversation_id = self._conversation_scope(str(args.get("_session_id") or ""))
         if tool_name == "loft_recall":
             return self._client.recall(
@@ -295,6 +297,9 @@ class OpenLoftMemoryProvider(MemoryProvider):
         return runtime_config(saved, self._hermes_home)
 
     def _warm(self, query: str, session_id: str) -> None:
+        if not self._ready():
+            return
+        assert self._client is not None
         try:
             self._client.recall(
                 query[:4000],
@@ -311,6 +316,9 @@ class OpenLoftMemoryProvider(MemoryProvider):
                 previous.join(timeout=_SYNC_JOIN_TIMEOUT)
             except RuntimeError:
                 pass
+        if not self._ready():
+            return
+        assert self._client is not None
         try:
             res = self._client.remember(
                 payload,

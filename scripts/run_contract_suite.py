@@ -150,6 +150,7 @@ class Substrate:
     def stop(self) -> None:
         if self._server is not None:
             self._server.should_exit = True
+        if self._thread is not None:
             self._thread.join(timeout=15)
 
 

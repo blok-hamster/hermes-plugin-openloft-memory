@@ -35,6 +35,7 @@ import tempfile
 import threading
 import types
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 PKG = "openloft_memory"
@@ -57,6 +58,7 @@ def _register_package() -> None:
             os.symlink(entry.resolve(), base / name)
     spec = importlib.util.spec_from_file_location(
         PKG, str(base / "__init__.py"), submodule_search_locations=[str(base)])
+    assert spec is not None and spec.loader is not None
     pkg = importlib.util.module_from_spec(spec)
     sys.modules[PKG] = pkg
     spec.loader.exec_module(pkg)  # runs the plugin's real register()
@@ -70,9 +72,9 @@ def _install_agent_stubs() -> None:
     except (ImportError, ValueError):
         pass
 
-    agent = types.ModuleType("agent")
+    agent: Any = types.ModuleType("agent")
 
-    memory = types.ModuleType("agent.memory_provider")
+    memory: Any = types.ModuleType("agent.memory_provider")
 
     class MemoryProvider:  # minimal stand-in, import-name-compatible only
         pass
@@ -85,7 +87,7 @@ def _install_agent_stubs() -> None:
     memory.MemoryProvider = MemoryProvider
     memory.spawn_context_thread = spawn_context_thread
 
-    secrets = types.ModuleType("agent.secret_scope")
+    secrets: Any = types.ModuleType("agent.secret_scope")
 
     def get_secret(name: str):
         """Profile-kit stand-in: the one variable the tests control."""

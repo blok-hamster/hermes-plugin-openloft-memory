@@ -6,3 +6,17 @@ requires-python = ">=3.11"
 license = "MIT"
 # dependencies = []  — deliberately omitted. The client is stdlib-only so the
 # plugin installs with no dependency union / consent step in any environment.
+
+[tool.pyrefly.errors]
+# The import graph here is runtime-conditional BY DESIGN, and static import
+# resolution cannot model it:
+#   - the plugin is imported by Hermes as a package under a name only Hermes
+#     chooses (the on-disk dir has hyphens, so a static checker names its root
+#     `__init__.py` `__unknown__` and can't see the `.scope`/`.provider` family);
+#   - `agent.*` imports exist only inside Hermes, `nmafc.*` / `app.main` only in
+#     the memory-service venv, and tests import the synthetic `openloft_memory`
+#     package that conftest registers at test time.
+# tests/test_registration.py proves every module imports cleanly under BOTH
+# real parentages, so the import graph is verified dynamically. All other
+# Pyrefly checks stay on.
+missing-import = false

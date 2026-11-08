@@ -22,6 +22,11 @@ if __package__ in (None, ""):
     _spec = importlib.util.spec_from_file_location(
         "openloft_memory", __file__,
         submodule_search_locations=[str(Path(__file__).resolve().parent)])
+    if _spec is None or _spec.loader is None:
+        # Cannot construct the module from this path; the module object itself
+        # still imports fine under Hermes' namespaced importer (the real
+        # parentage). This guard is unreachable for a real file path.
+        raise ImportError("openloft-memory: cannot load module spec from %s" % __file__)
     _mod = importlib.util.module_from_spec(_spec)
     sys.modules["openloft_memory"] = _mod
     _spec.loader.exec_module(_mod)

@@ -3,6 +3,7 @@
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 
@@ -61,7 +62,7 @@ class SubstrateStub(BaseHTTPRequestHandler):
     def do_GET(self):
         self._dispatch()
 
-    def log_message(self, *args):  # keep test output quiet
+    def log_message(self, format: str, *args: Any) -> None:  # keep test output quiet
         pass
 
 
