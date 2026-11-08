@@ -1,0 +1,14 @@
+name: openloft-memory
+repo: https://github.com/blok-hamster/hermes-plugin-openloft-memory
+sha: e5532491b94d573e3809cca6f73e1dbfc2467045
+version: "0.1.0"
+description: "OpenLoft Memory — persistent graph-backed long-term memory for any Hermes agent; recall before every turn, ingest after every turn, loft_* memory tools."
+tags:
+  - memory
+  - provider
+requires_hermes: ">=0.21.0"
+screenshots:
+  - https://raw.githubusercontent.com/blok-hamster/hermes-plugin-openloft-memory/e5532491b94d573e3809cca6f73e1dbfc2467045/docs/recall-demo.png
+  - https://raw.githubusercontent.com/blok-hamster/hermes-plugin-openloft-memory/e5532491b94d573e3809cca6f73e1dbfc2467045/docs/stats-panel.png
+homepage: https://github.com/blok-hamster/hermes-plugin-openloft-memory
+license: MIT

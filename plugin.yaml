@@ -16,3 +16,7 @@ hooks:
   - prefetch
   - queue_prefetch
   - sync_turn
+# Rule 14 (compatibility truth): requires_hermes SemVer floor declared in BOTH
+# this manifest and the catalog entry. FLOOR TBD — must be measured against a
+# real Hermes install before catalog submission (placeholder value below).
+requires_hermes: ">=0.21.0"
