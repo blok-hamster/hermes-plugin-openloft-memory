@@ -42,9 +42,10 @@ DEFAULT_TIMEOUTS = {
 class ServiceError(Exception):
     """Base class for every taxonomy branch the provider switches on."""
 
-    def __init__(self, message: str, *, status: int | None = None):
+    def __init__(self, message: str, *, status: int | None = None, code: str = ""):
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
 class AuthError(ServiceError):
@@ -53,6 +54,14 @@ class AuthError(ServiceError):
 
 class NotProvisioned(ServiceError):
     """The tenant behind this key has no memory store yet (503)."""
+
+
+class UpstreamUnavailable(ServiceError):
+    """The memory service or its upstream extraction provider is unavailable (502/503)."""
+
+
+class RequestTimeout(ServiceError):
+    """The memory request timed out before completing (504 / socket timeout)."""
 
 
 class RateLimited(ServiceError):
@@ -107,26 +116,54 @@ class ServiceClient:
                 if read_only and attempt <= CONNECT_RETRIES_READS:
                     time.sleep(CONNECT_RETRY_WAIT * attempt)
                     continue
+                if isinstance(exc, TimeoutError) or isinstance(
+                    getattr(exc, "reason", None), TimeoutError
+                ):
+                    raise RequestTimeout(
+                        f"memory request timed out: {exc}",
+                        status=504,
+                        code="memory_timeout",
+                    ) from None
                 raise ServiceErrorCatchall(f"memory backend unreachable: {exc}") from None
 
     @staticmethod
     def _classify(exc: urllib.error.HTTPError) -> ServiceError:
         status = exc.code
+        detail = ""
+        code = ""
         try:
-            detail = json.loads(exc.read().decode("utf-8", errors="replace")).get("detail", "")
+            parsed = json.loads(exc.read().decode("utf-8", errors="replace"))
+            if isinstance(parsed, dict):
+                detail = str(parsed.get("detail") or parsed.get("error") or "").strip()
+                code = str(parsed.get("code") or "").strip()
         except Exception:  # noqa: BLE001 - body may be a plain error page
-            detail = ""
+            pass
         if status in (401, 403):
-            return AuthError(detail or "key rejected", status=status)
-        if status == 503 and "provision" in str(detail).lower():
-            return NotProvisioned(str(detail) or "tenant not provisioned", status=status)
-        if status == 503:
-            return ServiceErrorCatchall(str(detail) or "backend unavailable", status=status)
+            return AuthError(detail or "key rejected", status=status, code=code)
+        if status == 503 and (code == "not_provisioned" or "provision" in detail.lower()):
+            return NotProvisioned(
+                detail or "tenant not provisioned",
+                status=status,
+                code=code or "not_provisioned",
+            )
+        if status in (502, 503):
+            return UpstreamUnavailable(
+                detail or "memory service temporarily unavailable",
+                status=status,
+                code=code or ("extraction_unavailable" if status == 503 else "memory_unavailable"),
+            )
+        if status == 504:
+            return RequestTimeout(
+                detail or "memory request timed out",
+                status=status,
+                code=code or "memory_timeout",
+            )
         if status == 429:
-            return RateLimited(detail or "rate limited", status=status)
+            return RateLimited(detail or "rate limited", status=status, code=code or "rate_limited")
         if status == 400:
-            return ScopeError(str(detail) or "invalid sub-scope", status=status)
-        return ServiceErrorCatchall(f"memory backend error {status}: {detail}", status=status)
+            return ScopeError(detail or "invalid sub-scope", status=status, code=code or "invalid_request")
+        suffix = f": {detail}" if detail else ""
+        return ServiceErrorCatchall(f"memory backend error {status}{suffix}", status=status, code=code)
 
     # -- substrate operations (plan §3.4) -----------------------------------
 

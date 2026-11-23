@@ -38,10 +38,17 @@ def turn_payload(user: str, assistant: str) -> list:
 def friendly_error(exc: Exception) -> str:
     """Model-facing error prose. Short, actionable, no stack traces."""
     text = str(exc) or type(exc).__name__
-    if type(exc).__name__ == "NotProvisioned":
+    kind = type(exc).__name__
+    if kind == "AuthError":
+        return f"{text} — check or re-mint your OpenLoft memory key"
+    if kind == "NotProvisioned":
         return f"{text} — mint a memory key from the dashboard, or check your key"
-    if type(exc).__name__ == "RateLimited":
+    if kind == "RateLimited":
         return f"{text} — slow down and retry shortly"
+    if kind == "UpstreamUnavailable":
+        return f"{text} — OpenLoft memory extraction is temporarily unavailable; reads still work"
+    if kind == "RequestTimeout":
+        return f"{text} — the memory service timed out; retry shortly"
     return text
 
 

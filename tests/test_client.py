@@ -8,9 +8,11 @@ import pytest
 from openloft_memory.client import (
     NotProvisioned,
     RateLimited,
+    RequestTimeout,
     ScopeError,
     ServiceClient,
     ServiceErrorCatchall,
+    UpstreamUnavailable,
 )
 from stubserver import serve_stub
 
@@ -75,6 +77,24 @@ class TestTaxonomy:
     def test_500_is_catchall(self, server_url):
         with pytest.raises(ServiceErrorCatchall):
             make(server_url).search("q", agent_id="boom")
+
+    def test_503_express_extraction_outage_is_upstream_unavailable(self, server_url):
+        with pytest.raises(UpstreamUnavailable) as excinfo:
+            make(server_url).remember(
+                [{"role": "user", "content": "hi"}], agent_id="extraction_down"
+            )
+        assert excinfo.value.status == 503
+        assert excinfo.value.code == "extraction_unavailable"
+        assert "temporarily unavailable" in str(excinfo.value)
+
+    def test_504_express_timeout_parses_error_field(self, server_url):
+        with pytest.raises(RequestTimeout) as excinfo:
+            make(server_url).remember(
+                [{"role": "user", "content": "hi"}], agent_id="timeout_504"
+            )
+        assert excinfo.value.status == 504
+        assert excinfo.value.code == "memory_timeout"
+        assert "timed out" in str(excinfo.value)
 
 
 class TestForgetShape:

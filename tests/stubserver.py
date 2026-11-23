@@ -40,6 +40,22 @@ class SubstrateStub(BaseHTTPRequestHandler):
             return self._reply(429, {"detail": "rate limited"})
         if key == "unprovisioned":
             return self._reply(503, {"detail": "tenant not provisioned: tenant has no key"})
+        if key == "extraction_down":
+            return self._reply(
+                503,
+                {
+                    "error": "Memory extraction is temporarily unavailable. Memory reads still work.",
+                    "code": "extraction_unavailable",
+                },
+            )
+        if key == "timeout_504":
+            return self._reply(
+                504,
+                {
+                    "error": "Memory request timed out. Please retry.",
+                    "code": "memory_timeout",
+                },
+            )
         if key == "boom":
             return self._reply(500, {"detail": "backend exploded"})
         SubstrateStub.seen = {"method": self.command, "path": parsed.path,

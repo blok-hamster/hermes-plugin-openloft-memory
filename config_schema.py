@@ -68,6 +68,11 @@ FIELDS = [
         "default": True,
     },
     {
+        "key": "sync_window_messages",
+        "description": "Max recent messages sent per turn for extraction (0 = full transcript)",
+        "default": 6,
+    },
+    {
         "key": "toolset_enabled",
         "description": "Expose the loft_* memory tools to the model",
         "default": True,

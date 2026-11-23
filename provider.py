@@ -28,7 +28,6 @@ import os
 import threading
 import contextvars
 import time
-from pathlib import Path
 from typing import Iterable
 
 # Documented Hermes surfaces only (catalog rule 9).
@@ -36,10 +35,13 @@ from agent.memory_provider import MemoryProvider
 from agent.secret_scope import get_secret
 
 from .client import (
+    AuthError,
     NotProvisioned,
     RateLimited,
+    RequestTimeout,
     ScopeError,
     ServiceClient,
+    UpstreamUnavailable,
 )
 from .config_schema import (
     DEFAULT_BASE_URL,
@@ -96,6 +98,11 @@ class OpenLoftMemoryProvider(MemoryProvider):
         self._checkpoint_digests: dict[str, str] = {}
         self._write_digests: dict[str, str] = {}
         self._backfill_digests: dict[str, str] = {}
+        self._ingest_state_lock = threading.Lock()
+        self._last_ingest_error: str | None = None
+        self._last_ingest_error_key: str | None = None
+        self._consecutive_ingest_failures: int = 0
+        self._notified_error_key: str | None = None
 
     # -- required ABC surface -------------------------------------------------
 
@@ -147,10 +154,16 @@ class OpenLoftMemoryProvider(MemoryProvider):
     # -- lifecycle hooks --------------------------------------------------------
 
     def prefetch(self, query: str, *, session_id: str = "", **kwargs):
-        """Synchronous, budgeted, fail-open recall. Returns injectable context."""
+        """Synchronous, budgeted, fail-open recall. Returns injectable context.
+
+        If background turn ingests are degraded, prepends a one-time notice so
+        the agent informs the user directly in chat (cleared once saving
+        recovers).
+        """
         if not self._ready():
             return None
         assert self._client is not None
+        notice = self._consume_ingest_notice()
         started = time.monotonic()
         try:
             res = self._client.recall(
@@ -162,17 +175,21 @@ class OpenLoftMemoryProvider(MemoryProvider):
         except NotProvisioned as exc:
             logger.warning("openloft-memory: not provisioned (%s ms) — %s",
                            _elapsed_ms(started), exc)
-            return None
+            return notice
         except Exception as exc:  # noqa: BLE001 - fail-open reads
             logger.warning("openloft-memory: prefetch degraded (%s ms) (%s)",
                            _elapsed_ms(started), exc)
-            return None
+            return notice
         logger.debug("openloft-memory: prefetch ok (%s ms)", _elapsed_ms(started))
 
         context = res.get("context") or ""
+        budget = int(self._cfg.get("inject_budget", 6000))
         if not context.strip():
-            return ""
-        return shrink(context, int(self._cfg.get("inject_budget", 6000)))
+            return notice if notice is not None else ""
+        trimmed = shrink(context, budget)
+        if notice:
+            return shrink(f"{notice}\n\n{trimmed}", budget)
+        return trimmed
 
     def queue_prefetch(self, query: str, *, session_id: str = "", **kwargs) -> None:
         """Fire-and-forget warm-up; result discarded."""
@@ -192,7 +209,17 @@ class OpenLoftMemoryProvider(MemoryProvider):
             return
         if self._context_kind not in {"primary", ""} and not self._cfg.get("ingest_nonprimary"):
             return
-        payload = list(messages) if messages else turn_payload(user_content, assistant_content)
+        if messages:
+            window = int(self._cfg.get("sync_window_messages", 6))
+            sliced = list(messages[-window:]) if window > 0 else list(messages)
+            # Ensure the slice contains at least one user message (the engine
+            # treats user-less transcripts as no-ops); fall back to the raw turn.
+            if any(isinstance(m, dict) and m.get("role") == "user" for m in sliced):
+                payload = sliced
+            else:
+                payload = turn_payload(user_content, assistant_content)
+        else:
+            payload = turn_payload(user_content, assistant_content)
         if not payload:
             return
         previous = self._sync_thread
@@ -339,14 +366,22 @@ class OpenLoftMemoryProvider(MemoryProvider):
 
     def get_status_config(self, provider_config: dict) -> dict:
         """Return status fields for `hermes memory status` display."""
-        return {
+        with self._ingest_state_lock:
+            last_error = self._last_ingest_error
+            failures = self._consecutive_ingest_failures
+        status = {
             "provider": self.name,
             "base_url": self._cfg.get("base_url", DEFAULT_BASE_URL),
             "agent_id": self._agent_id,
             "conversation_scope": self._conv_mode,
             "ingest_enabled": self._cfg.get("ingest_enabled", True),
             "toolset_enabled": self._cfg.get("toolset_enabled", True),
+            "ingest_status": "degraded" if last_error else "ok",
         }
+        if last_error:
+            status["last_ingest_error"] = last_error
+            status["consecutive_ingest_failures"] = failures
+        return status
 
     def backup_paths(self) -> list[str]:
         """Return on-disk paths outside HERMES_HOME for `hermes backup`.
@@ -594,6 +629,53 @@ class OpenLoftMemoryProvider(MemoryProvider):
         except Exception:  # noqa: BLE001 - warm-up is best-effort
             logger.debug("openloft-memory: warm skipped (%s ms)", _elapsed_ms(started))
 
+    def _record_ingest_success(self) -> None:
+        recovered_from = 0
+        with self._ingest_state_lock:
+            recovered_from = self._consecutive_ingest_failures
+            self._last_ingest_error = None
+            self._last_ingest_error_key = None
+            self._consecutive_ingest_failures = 0
+            self._notified_error_key = None
+        if recovered_from > 0:
+            logger.info(
+                "openloft-memory: ingest recovered after %d failed turn(s)",
+                recovered_from,
+            )
+
+    def _record_ingest_failure(self, exc: Exception) -> None:
+        message = friendly_error(exc)
+        err_key = (
+            f"{type(exc).__name__}:"
+            f"{getattr(exc, 'status', '')}:"
+            f"{getattr(exc, 'code', '')}"
+        )
+        with self._ingest_state_lock:
+            self._last_ingest_error = message
+            self._last_ingest_error_key = err_key
+            self._consecutive_ingest_failures += 1
+
+    def _consume_ingest_notice(self) -> str | None:
+        """Return a one-time degradation notice for the next turn when background
+        ingests are failing; returns None when healthy or already reported."""
+        with self._ingest_state_lock:
+            if not self._last_ingest_error or not self._last_ingest_error_key:
+                return None
+            immediate = self._last_ingest_error_key.startswith(
+                ("AuthError:", "NotProvisioned:", "UpstreamUnavailable:")
+            )
+            if not immediate and self._consecutive_ingest_failures < 2:
+                return None
+            if self._notified_error_key == self._last_ingest_error_key:
+                return None
+            self._notified_error_key = self._last_ingest_error_key
+            detail = self._last_ingest_error
+        return (
+            f"[OpenLoft Memory notice: saving recent turns is currently failing "
+            f"({detail}). Briefly alert the user in your reply that long-term "
+            f"memory saving is degraded.]"
+        )
+
     def _ingest(self, payload: list, session_id: str, previous: threading.Thread | None) -> None:
         if previous is not None:
             try:
@@ -610,15 +692,32 @@ class OpenLoftMemoryProvider(MemoryProvider):
                 agent_id=self._agent_id,
                 conversation_id=self._conversation_scope(session_id),
             )
+            self._record_ingest_success()
             logger.info(
                 "openloft-memory: ingested %s updates (turn %s, %s ms)",
                 res.get("updates_ingested"), res.get("turn"),
                 _elapsed_ms(started),
             )
         except RateLimited as exc:
-            logger.warning("openloft-memory: ingest rate-limited (next turn re-sends a "
-                           "fuller transcript); %s", exc)
+            self._record_ingest_failure(exc)
+            logger.warning(
+                "openloft-memory: ingest rate-limited (%s ms) (%s)",
+                _elapsed_ms(started), exc,
+            )
+        except (AuthError, NotProvisioned, UpstreamUnavailable) as exc:
+            self._record_ingest_failure(exc)
+            logger.error(
+                "openloft-memory: ingest failed (%s ms) (%s)",
+                _elapsed_ms(started), friendly_error(exc),
+            )
+        except RequestTimeout as exc:
+            self._record_ingest_failure(exc)
+            logger.error(
+                "openloft-memory: ingest timed out (%s ms) (%s)",
+                _elapsed_ms(started), exc,
+            )
         except Exception as exc:  # noqa: BLE001 - never fail the turn for memory
+            self._record_ingest_failure(exc)
             logger.error("openloft-memory: ingest failed (%s ms) (%s); the next turn's "
                          "fuller transcript is the recovery path",
                          _elapsed_ms(started), exc)

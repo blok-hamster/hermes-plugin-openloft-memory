@@ -19,7 +19,7 @@ from openloft_memory.provider import OpenLoftMemoryProvider
 from stubserver import serve_stub, SubstrateStub
 
 try:
-    from agent.memory_provider import MemoryManager  # noqa: F401
+    from agent.memory_manager import MemoryManager  # noqa: F401
     HAS_REAL_HERMES = True
 except Exception:  # noqa: BLE001
     HAS_REAL_HERMES = False
@@ -188,7 +188,8 @@ class TestConfigBinding:
 
     def test_agent_id_resolution_lives_on_the_instance(self, monkeypatch, tmp_path):
         prof_a, prof_b = tmp_path / "a", tmp_path / "b"
-        prof_a.mkdir(); prof_b.mkdir()
+        prof_a.mkdir()
+        prof_b.mkdir()
         with_key(monkeypatch, "nmafc_t.k")
         one = OpenLoftMemoryProvider()
         one.initialize("s", hermes_home=str(prof_a), agent_identity="alpha")
@@ -459,13 +460,6 @@ class TestBackfill:
         prov, httpd = provider(cfg={"backfill_enabled": True,
                                     "backfill_rate_ms": 0})
         try:
-            # Make the stub 429 on the first remember, ok on the second
-            seen_count = {"n": 0}
-
-            class _RateLimitStub:
-                pass
-
-            # Use the real stub but flip it to 429 then back via seen tracking
             SubstrateStub.seen = {}
             sessions = self._sessions(2)
             result = prov.backfill(sessions)
@@ -484,6 +478,97 @@ class TestBackfill:
             prov.backfill(self._sessions(1))
             assert SubstrateStub.seen["body"]["agent_id"] == "probe"
             assert SubstrateStub.seen["body"].get("conversation_id") in (None, "")
+        finally:
+            httpd.shutdown()
+
+
+class TestDegradationNoticeAndSyncWindow:
+    """One-time prefetch() degradation notice, recovery reset, status & payload trimming."""
+
+    def test_upstream_outage_emits_one_time_prefetch_notice_and_clears_on_recovery(self, caplog):
+        prov, httpd = provider()
+        caplog.set_level(logging.INFO)
+        try:
+            # 1. Background ingest hits 503 extraction_unavailable
+            prov._agent_id = "extraction_down"
+            prov.sync_turn("My name is Ada", "Nice to meet you")
+            assert prov._sync_thread is not None
+            prov._sync_thread.join(timeout=5.0)
+
+            # Logs keep the clear server error (without misleading recovery prose)
+            assert any("temporarily unavailable" in r.message for r in caplog.records)
+            status = prov.get_status_config({})
+            assert status["ingest_status"] == "degraded"
+            assert "temporarily unavailable" in status["last_ingest_error"]
+
+            # 2. Next prefetch emits the degradation notice ONCE
+            prov._agent_id = "probe"  # recall succeeds while extraction is degraded
+            first_prefetch = prov.prefetch("who am I?")
+            assert first_prefetch is not None
+            assert "OpenLoft Memory notice" in first_prefetch
+            assert "temporarily unavailable" in first_prefetch
+
+            # Second prefetch does NOT spam the same notice again
+            second_prefetch = prov.prefetch("who am I?")
+            assert second_prefetch is None or "OpenLoft Memory notice" not in second_prefetch
+
+            # 3. Once a subsequent ingest succeeds, degraded state and notice dedup clear
+            prov.sync_turn("My name is Ada", "Got it")
+            assert prov._sync_thread is not None
+            prov._sync_thread.join(timeout=5.0)
+            recovered = prov.get_status_config({})
+            assert recovered["ingest_status"] == "ok"
+            assert "last_ingest_error" not in recovered
+        finally:
+            httpd.shutdown()
+
+    def test_transient_timeout_notifies_after_two_consecutive_failures(self):
+        prov, httpd = provider()
+        try:
+            prov._agent_id = "timeout_504"
+            prov.sync_turn("turn 1", "reply 1")
+            assert prov._sync_thread is not None
+            prov._sync_thread.join(timeout=5.0)
+            # First transient timeout is logged/tracked in status, not yet in-chat
+            prov._agent_id = "probe"
+            assert "OpenLoft Memory notice" not in (prov.prefetch("q") or "")
+
+            # Second consecutive timeout triggers the one-time in-chat notice
+            prov._agent_id = "timeout_504"
+            prov.sync_turn("turn 2", "reply 2")
+            assert prov._sync_thread is not None
+            prov._sync_thread.join(timeout=5.0)
+            prov._agent_id = "probe"
+            notice = prov.prefetch("q") or ""
+            assert "OpenLoft Memory notice" in notice
+            assert "timed out" in notice
+        finally:
+            httpd.shutdown()
+
+    def test_sync_turn_windows_long_transcript_and_preserves_user_message(self):
+        prov, httpd = provider(cfg={"sync_window_messages": 4})
+        try:
+            SubstrateStub.seen = {}
+            long_history = [
+                {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+                for i in range(20)
+            ]
+            prov.sync_turn("msg 18", "msg 19", messages=long_history)
+            assert prov._sync_thread is not None
+            prov._sync_thread.join(timeout=5.0)
+            sent = SubstrateStub.seen["body"]["messages"]
+            assert len(sent) == 4
+            assert sent[0]["content"] == "msg 16"
+            assert sent[-1]["content"] == "msg 19"
+
+            # If the window contains only tool/assistant messages, fall back to turn_payload
+            SubstrateStub.seen = {}
+            tool_tail = [{"role": "assistant", "content": f"tool {i}"} for i in range(6)]
+            prov.sync_turn("actual user turn", "final reply", messages=tool_tail)
+            assert prov._sync_thread is not None
+            prov._sync_thread.join(timeout=5.0)
+            sent_fallback = SubstrateStub.seen["body"]["messages"]
+            assert sent_fallback[0] == {"role": "user", "content": "actual user turn"}
         finally:
             httpd.shutdown()
 
